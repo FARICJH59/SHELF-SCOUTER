@@ -115,7 +115,7 @@ def _find_label(ranges: list[dict], value: float, default: str = "unknown") -> s
     """Return the label for the first range that contains *value*."""
     for entry in ranges:
         lo, hi = entry["range"]
-        if lo <= value < hi:
+        if lo <= value <= hi:
             return entry.get("aisle") or entry.get("shelf") or default
     return default
 

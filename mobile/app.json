@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "Shelf Scouter",
+    "slug": "shelf-scouter",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0f172a"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.shelfscouter.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Shelf Scouter uses your camera to scan store shelves.",
+        "NSLocationWhenInUseUsageDescription": "Shelf Scouter uses your location to identify the store you are in.",
+        "NSMotionUsageDescription": "Shelf Scouter uses device motion to determine shelf orientation."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0f172a"
+      },
+      "package": "com.shelfscouter.app",
+      "permissions": [
+        "CAMERA",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ]
+    },
+    "plugins": [
+      "expo-camera",
+      "expo-location",
+      [
+        "expo-router",
+        {
+          "root": "./src/screens"
+        }
+      ]
+    ],
+    "scheme": "shelfscouter",
+    "extra": {
+      "apiBaseUrl": "http://localhost:5000"
+    }
+  }
+}
