@@ -9,6 +9,8 @@ import base64
 import json
 import logging
 import os
+import uuid
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -209,6 +211,15 @@ def scan_shelf_image(image: Image.Image, search_query: str | None = None) -> dic
 
 
 # ---------------------------------------------------------------------------
+# In-memory session store
+# NOTE: Sessions are stored in process memory and will not persist across
+# server restarts. For production use, replace with a persistent store
+# (e.g., Redis or a database).
+# ---------------------------------------------------------------------------
+_sessions: dict = {}
+
+
+# ---------------------------------------------------------------------------
 # Flask application
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
@@ -389,6 +400,60 @@ def search():
     result["found"] = len(matches) > 0
     result["query"] = query
     return jsonify(result)
+
+
+@app.route("/scan/session/start", methods=["POST"])
+def session_start():
+    """
+    Create a new scanning session with optional GPS/QGPS context.
+
+    Accepts JSON body:
+        {
+            "gps":         { "lat": <float>, "lng": <float>, "accuracy": <float> },
+            "qgps":        { "x": <float>, "y": <float>, "z": <float>,
+                             "floor": <int>, "accuracy_mm": <float> },
+            "orientation": { "pitch": <float>, "yaw": <float>, "roll": <float> },
+            "device_id":   "<string>"
+        }
+
+    Returns:
+        { "session_id": "<uuid>" }
+    """
+    payload = request.get_json(silent=True) or {}
+    session_id = str(uuid.uuid4())
+    _sessions[session_id] = {
+        "session_id": session_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "gps": payload.get("gps"),
+        "qgps": payload.get("qgps"),
+        "orientation": payload.get("orientation"),
+        "device_id": payload.get("device_id"),
+        "frames": [],
+    }
+    logger.info("Session created: %s (device=%s)", session_id, payload.get("device_id"))
+    return jsonify({"session_id": session_id})
+
+
+@app.route("/scan/session/<session_id>/export", methods=["GET"])
+def session_export(session_id: str):
+    """
+    Export all scan data collected during a session.
+
+    Returns:
+        {
+            "session_id": "<uuid>",
+            "created_at": "<ISO-8601 timestamp>",
+            "gps":        { ... },
+            "qgps":       { ... },
+            "orientation":{ ... },
+            "device_id":  "<string>",
+            "frames":     [ ... ]
+        }
+    """
+    session = _sessions.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify(session)
 
 
 # ---------------------------------------------------------------------------

@@ -226,5 +226,66 @@ class TestDecodeImage(unittest.TestCase):
         self.assertIsNotNone(img)
 
 
+class TestSessionEndpoints(unittest.TestCase):
+    def setUp(self):
+        shelf_app.app.config["TESTING"] = True
+        self.client = shelf_app.app.test_client()
+        # Clear sessions before each test
+        shelf_app._sessions.clear()
+
+    def test_session_start_returns_session_id(self):
+        resp = self.client.post(
+            "/scan/session/start",
+            json={
+                "gps": {"lat": 38.8951, "lng": -77.0364, "accuracy": 5},
+                "qgps": {"x": 0.0, "y": 0.0, "z": 0.0, "floor": 1, "accuracy_mm": 15},
+                "orientation": {"pitch": 0, "yaw": 0, "roll": 0},
+                "device_id": "phone-test",
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertIn("session_id", data)
+        self.assertIsNotNone(data["session_id"])
+
+    def test_session_start_empty_body(self):
+        resp = self.client.post("/scan/session/start", json={})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("session_id", resp.get_json())
+
+    def test_session_export_returns_session(self):
+        start_resp = self.client.post(
+            "/scan/session/start",
+            json={
+                "gps": {"lat": 38.8951, "lng": -77.0364, "accuracy": 5},
+                "device_id": "phone-test",
+            },
+        )
+        session_id = start_resp.get_json()["session_id"]
+
+        export_resp = self.client.get(f"/scan/session/{session_id}/export")
+        self.assertEqual(export_resp.status_code, 200)
+        data = export_resp.get_json()
+        self.assertEqual(data["session_id"], session_id)
+        self.assertEqual(data["device_id"], "phone-test")
+        self.assertIn("created_at", data)
+        self.assertIn("frames", data)
+        self.assertEqual(data["frames"], [])
+
+    def test_session_export_not_found(self):
+        resp = self.client.get("/scan/session/nonexistent-id/export")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("error", resp.get_json())
+
+    def test_session_stores_qgps(self):
+        qgps = {"x": 1.5, "y": 2.3, "z": 0.0, "floor": 2, "accuracy_mm": 10}
+        start_resp = self.client.post(
+            "/scan/session/start", json={"qgps": qgps}
+        )
+        session_id = start_resp.get_json()["session_id"]
+        export_resp = self.client.get(f"/scan/session/{session_id}/export")
+        self.assertEqual(export_resp.get_json()["qgps"], qgps)
+
+
 if __name__ == "__main__":
     unittest.main()
