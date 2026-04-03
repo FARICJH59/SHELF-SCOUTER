@@ -61,6 +61,32 @@ sys.modules.setdefault("PIL", pil_stub)
 sys.modules["PIL.Image"] = image_mod
 
 # ---------------------------------------------------------------------------
+# Stub out pyzbar so tests run without the C library installed
+# ---------------------------------------------------------------------------
+pyzbar_pkg = types.ModuleType("pyzbar")
+pyzbar_mod = types.ModuleType("pyzbar.pyzbar")
+
+class _FakeRect:
+    def __init__(self):
+        self.left = 10
+        self.top = 20
+        self.width = 80
+        self.height = 40
+
+class _FakeBarcode:
+    def __init__(self, btype, data):
+        self.type = btype
+        self.data = data
+        self.rect = _FakeRect()
+
+# By default decode returns an empty list; individual tests override this.
+pyzbar_mod.decode = MagicMock(return_value=[])
+pyzbar_pkg.pyzbar = pyzbar_mod
+
+sys.modules.setdefault("pyzbar", pyzbar_pkg)
+sys.modules["pyzbar.pyzbar"] = pyzbar_mod
+
+# ---------------------------------------------------------------------------
 # Now import app under test
 # ---------------------------------------------------------------------------
 import importlib
@@ -285,6 +311,113 @@ class TestSessionEndpoints(unittest.TestCase):
         session_id = start_resp.get_json()["session_id"]
         export_resp = self.client.get(f"/scan/session/{session_id}/export")
         self.assertEqual(export_resp.get_json()["qgps"], qgps)
+
+
+class TestBarcodeEndpoint(unittest.TestCase):
+    def setUp(self):
+        shelf_app.app.config["TESTING"] = True
+        self.client = shelf_app.app.test_client()
+        # Reset the pyzbar mock before each test
+        pyzbar_mod.decode.reset_mock()
+        pyzbar_mod.decode.return_value = []
+
+    def test_barcode_missing_image_returns_400(self):
+        resp = self.client.post("/barcode", json={})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("error", resp.get_json())
+
+    def test_barcode_invalid_image_returns_400(self):
+        resp = self.client.post(
+            "/barcode",
+            json={"image": "not-valid-base64!!!"},
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_barcode_no_barcodes_found(self):
+        pyzbar_mod.decode.return_value = []
+        resp = self.client.post(
+            "/barcode",
+            json={"image": _make_b64_image()},
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["total"], 0)
+        self.assertEqual(data["barcodes"], [])
+
+    def test_barcode_returns_decoded_barcodes(self):
+        pyzbar_mod.decode.return_value = [
+            _FakeBarcode("EAN13", b"5012345678900"),
+            _FakeBarcode("QRCODE", b"https://example.com/product"),
+        ]
+        resp = self.client.post(
+            "/barcode",
+            json={"image": _make_b64_image()},
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["total"], 2)
+        self.assertEqual(data["barcodes"][0]["type"], "EAN13")
+        self.assertEqual(data["barcodes"][0]["data"], "5012345678900")
+        self.assertIn("rect", data["barcodes"][0])
+        self.assertEqual(data["barcodes"][1]["type"], "QRCODE")
+
+    def test_barcode_rect_fields(self):
+        pyzbar_mod.decode.return_value = [_FakeBarcode("EAN13", b"1234567890123")]
+        resp = self.client.post(
+            "/barcode",
+            json={"image": _make_b64_image()},
+            content_type="application/json",
+        )
+        bc = resp.get_json()["barcodes"][0]
+        self.assertEqual(bc["rect"]["left"], 10)
+        self.assertEqual(bc["rect"]["top"], 20)
+        self.assertEqual(bc["rect"]["width"], 80)
+        self.assertEqual(bc["rect"]["height"], 40)
+
+    def test_barcode_lookup_enriches_ean13(self):
+        pyzbar_mod.decode.return_value = [_FakeBarcode("EAN13", b"5012345678900")]
+        mock_product = {
+            "product_name": "Test Product",
+            "brands": "Test Brand",
+            "categories": "snacks",
+            "quantity": "100g",
+            "image_url": "https://example.com/img.jpg",
+        }
+        with patch.object(shelf_app, "_lookup_barcode_product", return_value=mock_product):
+            resp = self.client.post(
+                "/barcode",
+                json={"image": _make_b64_image(), "lookup": True},
+                content_type="application/json",
+            )
+        data = resp.get_json()
+        self.assertEqual(data["total"], 1)
+        self.assertIn("product", data["barcodes"][0])
+        self.assertEqual(data["barcodes"][0]["product"]["product_name"], "Test Product")
+
+    def test_barcode_lookup_skipped_for_qr_code(self):
+        pyzbar_mod.decode.return_value = [_FakeBarcode("QRCODE", b"https://example.com")]
+        with patch.object(shelf_app, "_lookup_barcode_product") as mock_lookup:
+            resp = self.client.post(
+                "/barcode",
+                json={"image": _make_b64_image(), "lookup": True},
+                content_type="application/json",
+            )
+            mock_lookup.assert_not_called()
+        data = resp.get_json()
+        self.assertNotIn("product", data["barcodes"][0])
+
+    def test_barcode_lookup_not_triggered_without_flag(self):
+        pyzbar_mod.decode.return_value = [_FakeBarcode("EAN13", b"5012345678900")]
+        with patch.object(shelf_app, "_lookup_barcode_product") as mock_lookup:
+            self.client.post(
+                "/barcode",
+                json={"image": _make_b64_image()},
+                content_type="application/json",
+            )
+            mock_lookup.assert_not_called()
 
 
 if __name__ == "__main__":
