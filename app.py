@@ -3,6 +3,12 @@ SHELF-SCOUTER – Gemma 4 powered shelf-scanning service.
 
 Analyses shelf images from IoT cameras / grocery-platform uploads and returns
 structured product information using Gemma 4's multimodal vision capabilities.
+
+Session endpoints enable multi-frame scanning:
+    POST /scan/session/start          – create a session with QGPS metadata
+    POST /scan/session/<id>/frame     – upload and process a single frame
+    POST /scan/session/<id>/finalize  – fuse all frames and return final result
+    GET  /scan/session/<id>           – retrieve session state
 """
 
 import base64
@@ -17,6 +23,10 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from PIL import Image
+
+import multi_frame as mf
+import sessions as session_store
+import store_mapping
 
 load_dotenv()
 
@@ -389,6 +399,248 @@ def search():
     result["found"] = len(matches) > 0
     result["query"] = query
     return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Session endpoints (multi-frame scanning)
+# ---------------------------------------------------------------------------
+
+@app.route("/scan/session/start", methods=["POST"])
+def session_start():
+    """
+    Start a new multi-frame scanning session.
+
+    Accepts JSON body:
+        {
+            "gps": {
+                "latitude": <float>,
+                "longitude": <float>,
+                "accuracy": <float>   // metres, optional
+            },
+            "orientation": {
+                "pitch": <float>,     // degrees
+                "yaw":   <float>,     // degrees
+                "roll":  <float>      // degrees
+            },
+            "store_id": "<string>"    // optional override
+        }
+
+    Returns:
+        {
+            "session_id": "<uuid>",
+            "store_id": "<string | null>",
+            "aisle": "<string | null>",
+            "shelf": "<string | null>",
+            "timestamp": "<ISO-8601>"
+        }
+    """
+    payload = request.get_json(silent=True) or {}
+
+    gps = payload.get("gps")
+    orientation = payload.get("orientation")
+
+    if not isinstance(gps, dict):
+        return jsonify({"error": "Missing or invalid 'gps' field"}), 400
+    if not isinstance(orientation, dict):
+        return jsonify({"error": "Missing or invalid 'orientation' field"}), 400
+
+    for key in ("latitude", "longitude"):
+        if not isinstance(gps.get(key), (int, float)):
+            return jsonify({"error": f"gps.{key} must be a number"}), 400
+
+    for key in ("pitch", "yaw", "roll"):
+        if not isinstance(orientation.get(key), (int, float)):
+            return jsonify({"error": f"orientation.{key} must be a number"}), 400
+
+    # Resolve store from GPS unless caller already supplied one
+    store_id: str | None = payload.get("store_id") or store_mapping.map_gps(
+        gps["latitude"], gps["longitude"]
+    )
+
+    # Resolve aisle/shelf from orientation
+    location: dict = {}
+    if store_id:
+        location = store_mapping.map_orientation(
+            store_id, orientation["pitch"], orientation["yaw"], orientation["roll"]
+        )
+
+    session = session_store.create_session(
+        gps=gps,
+        orientation=orientation,
+        store_id=store_id,
+    )
+
+    # Persist orientation-derived location in the session
+    session["aisle"] = location.get("aisle")
+    session["shelf"] = location.get("shelf")
+
+    logger.info(
+        "Session created: %s  store=%s  aisle=%s",
+        session["session_id"],
+        store_id,
+        location.get("aisle"),
+    )
+
+    return jsonify(
+        {
+            "session_id": session["session_id"],
+            "store_id": store_id,
+            "aisle": location.get("aisle"),
+            "shelf": location.get("shelf"),
+            "timestamp": session["timestamp"],
+        }
+    ), 201
+
+
+@app.route("/scan/session/<session_id>/frame", methods=["POST"])
+def session_upload_frame(session_id: str):
+    """
+    Upload and process a single frame within an existing session.
+
+    Accepts JSON body:
+        {
+            "image":       "<base64-encoded image or data URL>",
+            "frame_index": <int>,      // 0-based index within the session
+            "query":       "<string>"  // optional focus query
+        }
+
+    Returns:
+        {
+            "session_id":  "<uuid>",
+            "frame_index": <int>,
+            "frame_count": <int>,
+            "result": { ...scan result... }
+        }
+    """
+    if not GOOGLE_API_KEY:
+        return jsonify({"error": "GOOGLE_API_KEY not configured"}), 503
+
+    session = session_store.get_session(session_id)
+    if session is None:
+        return jsonify({"error": "Session not found"}), 404
+    if session["status"] != "open":
+        return jsonify({"error": "Session is already finalised"}), 409
+
+    payload = request.get_json(silent=True) or {}
+    image_data = payload.get("image")
+    if not image_data:
+        return jsonify({"error": "Missing 'image' field"}), 400
+
+    frame_index = payload.get("frame_index", len(session["frames"]))
+
+    try:
+        image = _decode_image(image_data)
+    except Exception:
+        logger.exception("Failed to decode frame image")
+        return jsonify({"error": "Invalid image data"}), 400
+
+    search_query = payload.get("query")
+
+    try:
+        result = scan_shelf_image(image, search_query)
+    except Exception:
+        logger.exception("Gemma 4 inference failed for frame")
+        return jsonify({"error": "Inference failed"}), 500
+
+    frame_record = {
+        "frame_index": frame_index,
+        "result": result,
+    }
+
+    if not session_store.add_frame(session_id, frame_record):
+        return jsonify({"error": "Could not add frame to session"}), 409
+
+    current_session = session_store.get_session(session_id)
+    frame_count = len(current_session["frames"]) if current_session else 0
+
+    logger.info("Frame %d added to session %s", frame_index, session_id)
+
+    return jsonify(
+        {
+            "session_id": session_id,
+            "frame_index": frame_index,
+            "frame_count": frame_count,
+            "result": result,
+        }
+    )
+
+
+@app.route("/scan/session/<session_id>/finalize", methods=["POST"])
+def session_finalize(session_id: str):
+    """
+    Finalise a session: fuse all uploaded frames and return the merged result.
+
+    No request body required.
+
+    Returns:
+        {
+            "session_id":  "<uuid>",
+            "store_id":    "<string | null>",
+            "aisle":       "<string | null>",
+            "shelf":       "<string | null>",
+            "products":    [...],
+            "shelf_summary":         "<string>",
+            "total_unique_products": <int>,
+            "frames_processed":      <int>,
+            "model":       "<model id>"
+        }
+    """
+    session = session_store.get_session(session_id)
+    if session is None:
+        return jsonify({"error": "Session not found"}), 404
+    if session["status"] == "finalized":
+        return jsonify({"error": "Session already finalised", "result": session["result"]}), 409
+
+    frames = session.get("frames", [])
+    if not frames:
+        return jsonify({"error": "No frames uploaded to this session"}), 400
+
+    fused = mf.fuse_frames(frames)
+
+    # Enrich with store/location context
+    fused["store_id"] = session.get("store_id")
+    fused["aisle"] = session.get("aisle")
+    fused["shelf"] = session.get("shelf")
+    fused["session_id"] = session_id
+
+    session_store.finalize_session(session_id, fused)
+
+    logger.info(
+        "Session finalised: %s  unique_products=%d  frames=%d",
+        session_id,
+        fused["total_unique_products"],
+        fused["frames_processed"],
+    )
+
+    return jsonify(fused)
+
+
+@app.route("/scan/session/<session_id>", methods=["GET"])
+def session_get(session_id: str):
+    """
+    Retrieve the current state of a scanning session.
+
+    Returns:
+        Full session dict (without raw frame images).
+    """
+    session = session_store.get_session(session_id)
+    if session is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    # Return a summary without bulky frame image data
+    summary = {
+        "session_id": session["session_id"],
+        "store_id": session.get("store_id"),
+        "aisle": session.get("aisle"),
+        "shelf": session.get("shelf"),
+        "timestamp": session["timestamp"],
+        "gps": session["gps"],
+        "orientation": session["orientation"],
+        "status": session["status"],
+        "frame_count": len(session.get("frames", [])),
+        "result": session.get("result"),
+    }
+    return jsonify(summary)
 
 
 # ---------------------------------------------------------------------------
