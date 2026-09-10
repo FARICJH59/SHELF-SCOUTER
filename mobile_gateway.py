@@ -3,6 +3,12 @@
 The existing scan capability remains intact. The v1 picking surface adds an
 additive fast-path, identity-verification, HOARE admission, and execution
 feedback boundary before a pick can be confirmed.
+
+Security boundary:
+- Client requests can propose evidence, but cannot self-authorize a resource route.
+- Resource-route ALLOW/DENY/ESCALATE decisions are accepted only from a trusted
+  internal caller presenting HOARE_INTERNAL_ROUTE_TOKEN.
+- If no trusted route is available, execution escalates rather than assuming ALLOW.
 """
 
 import os
@@ -19,6 +25,7 @@ from hoare_pick_admission import AdmissionDecision, PickRequest, ResourceRoute, 
 from execution_feedback import ExecutionFeedbackRecorder
 
 _feedback = ExecutionFeedbackRecorder()
+_INTERNAL_ROUTE_TOKEN = os.getenv("HOARE_INTERNAL_ROUTE_TOKEN")
 
 
 def _session(session_id):
@@ -69,6 +76,41 @@ def _identity_from_frame(frame: dict, requested_sku: str | None = None):
         visual_match=bool(verification.get("visual_match")),
         ocr_match=bool(verification.get("ocr_match")),
         evidence=evidence,
+    )
+
+
+def _trusted_resource_route(payload: dict) -> ResourceRoute:
+    """Accept a route decision only from a trusted internal HOARE caller.
+
+    The mobile/client surface must never be able to submit resource_route.decision
+    directly. Without the internal token, the safe default is ESCALATE.
+    """
+    route_payload = payload.get("resource_route") or {}
+    token = request.headers.get("X-HOARE-Internal-Route-Token")
+    if not _INTERNAL_ROUTE_TOKEN or token != _INTERNAL_ROUTE_TOKEN:
+        return ResourceRoute(
+            decision=AdmissionDecision.ESCALATE,
+            reason=["trusted_resource_authority_required"],
+        )
+    try:
+        decision = AdmissionDecision(str(route_payload.get("decision", "ESCALATE")))
+    except ValueError:
+        return ResourceRoute(
+            decision=AdmissionDecision.DENY,
+            reason=["invalid_resource_route_decision"],
+        )
+    reason = route_payload.get("reason", [])
+    if not isinstance(reason, list) or not all(isinstance(item, str) for item in reason):
+        return ResourceRoute(
+            decision=AdmissionDecision.DENY,
+            reason=["invalid_resource_route_reason"],
+        )
+    return ResourceRoute(
+        decision=decision,
+        provider=route_payload.get("provider"),
+        region=route_payload.get("region"),
+        predicted_latency_ms=route_payload.get("predicted_latency_ms"),
+        reason=reason,
     )
 
 
@@ -178,12 +220,7 @@ def v1_admission(session_id):
     if not frame:
         return jsonify({"error": "Source frame not found"}), 404
     identity = _identity_from_frame(frame, requested_sku)
-    route_payload = payload.get("resource_route") or {}
-    try:
-        decision = AdmissionDecision(str(route_payload.get("decision", "ALLOW")))
-    except ValueError:
-        return jsonify({"error": "resource_route.decision must be ALLOW, DENY, or ESCALATE"}), 400
-    route = ResourceRoute(decision=decision, provider=route_payload.get("provider"), region=route_payload.get("region"), predicted_latency_ms=route_payload.get("predicted_latency_ms"), reason=route_payload.get("reason", []))
+    route = _trusted_resource_route(payload)
     admission = admit_pick(PickRequest(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id") or payload.get("order_id", "unknown"), requested_sku=requested_sku, device_id=session.get("device_id") or "unknown", store_id=session.get("store_id"), aisle=payload.get("aisle"), shelf=payload.get("shelf")), identity, route)
     return jsonify({"decision": admission.decision.value, "reasons": admission.reasons, "identity": identity_summary(identity), "resource_route": route.__dict__, "next_action": "CONFIRM_PICK" if admission.decision is AdmissionDecision.ALLOW else "RECAPTURE_OR_TARGETED_VERIFICATION" if admission.decision is AdmissionDecision.ESCALATE else "STOP"})
 
@@ -203,16 +240,17 @@ def v1_pick(session_id):
     if not frame:
         return jsonify({"error": "Source frame not found"}), 404
     identity = _identity_from_frame(frame, requested_sku)
-    admission = admit_pick(PickRequest(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, device_id=session.get("device_id") or "unknown", store_id=session.get("store_id"), aisle=payload.get("aisle"), shelf=payload.get("shelf")), identity)
+    route = _trusted_resource_route(payload)
+    admission = admit_pick(PickRequest(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, device_id=session.get("device_id") or "unknown", store_id=session.get("store_id"), aisle=payload.get("aisle"), shelf=payload.get("shelf")), identity, route)
     if admission.decision is not AdmissionDecision.ALLOW:
         code = 409 if admission.decision is AdmissionDecision.ESCALATE else 403
-        return jsonify({"status": admission.decision.value, "reasons": admission.reasons, "identity": identity_summary(identity), "action": "RECAPTURE_OR_TARGETED_VERIFICATION" if admission.decision is AdmissionDecision.ESCALATE else "STOP"}), code
+        return jsonify({"status": admission.decision.value, "reasons": admission.reasons, "identity": identity_summary(identity), "resource_route": route.__dict__, "action": "RECAPTURE_OR_TARGETED_VERIFICATION" if admission.decision is AdmissionDecision.ESCALATE else "STOP"}), code
     quantity = int(payload.get("quantity", 1))
     if quantity < 1:
         return jsonify({"error": "quantity must be >= 1"}), 400
-    execution = _feedback.start(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, provider=payload.get("provider", "edge"), region=payload.get("region", "edge-local"), device_id=session.get("device_id") or "unknown", model=(frame.get("result") or {}).get("model", "targeted-vision"))
+    execution = _feedback.start(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, provider=route.provider or payload.get("provider", "edge"), region=route.region or payload.get("region", "edge-local"), device_id=session.get("device_id") or "unknown", model=(frame.get("result") or {}).get("model", "targeted-vision"))
     completed = _feedback.complete(execution.execution_id, success=True, identity_status=identity.status.value, identity_confidence=identity.confidence)
-    pick = {"pick_id": str(uuid4()), "timestamp": datetime.now(timezone.utc).isoformat(), "product": product, "sku": requested_sku, "gtin": payload.get("gtin"), "quantity": quantity, "source_frame_id": source_frame_id, "status": "confirmed", "admission": {"decision": admission.decision.value, "reasons": admission.reasons}, "execution": _feedback.telemetry_observation(completed.execution_id)}
+    pick = {"pick_id": str(uuid4()), "timestamp": datetime.now(timezone.utc).isoformat(), "product": product, "sku": requested_sku, "gtin": payload.get("gtin"), "quantity": quantity, "source_frame_id": source_frame_id, "status": "confirmed", "admission": {"decision": admission.decision.value, "reasons": admission.reasons}, "resource_route": route.__dict__, "execution": _feedback.telemetry_observation(completed.execution_id)}
     session["picks"].append(pick)
     return jsonify(pick)
 
