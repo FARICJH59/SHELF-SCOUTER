@@ -3,6 +3,13 @@
 Client-supplied vision/barcode fields are observations only. This module creates
 signed evidence only after a trusted server-side verification path has compared
 those observations with an authorized retailer adapter.
+
+Security rule:
+- A client-supplied barcode alone can NEVER establish trusted identity.
+- Until the gateway has a server-derived barcode observation, barcode matching
+  is supporting evidence only.
+- The current adapter path therefore requires the server-side vision candidate
+  SKU to exactly match the requested SKU before issuing evidence.
 """
 from __future__ import annotations
 
@@ -85,18 +92,38 @@ def verify_against_adapter(*, authority: TrustedEvidenceAuthority, adapter: Reta
                            session_id: str, frame_id: str, requested_sku: str,
                            detected_sku: str | None, barcode: str | None,
                            store_id: str | None = None) -> TrustedProductEvidence | None:
-    """Issue evidence only when an authorized adapter establishes a match."""
+    """Issue evidence only when an authorized adapter establishes a frame-linked match.
+
+    ``barcode`` is currently an untrusted client observation. It may contribute
+    to the returned evidence only after the server-side candidate SKU already
+    matches the requested SKU. This prevents an attacker from supplying a known
+    GTIN for an unrelated product and obtaining VERIFIED identity.
+
+    A future server-derived barcode decoder can safely strengthen this path by
+    passing a trusted barcode observation and allowing barcode-only verification.
+    """
     if not authority.configured:
         return None
-    query = detected_sku or requested_sku
-    items = adapter.resolve_item(query=query, store_id=store_id, barcode=barcode)
+
+    if not detected_sku or detected_sku != requested_sku:
+        return None
+
+    items = adapter.resolve_item(query=detected_sku, store_id=store_id, barcode=barcode)
     catalog_match = any(item.sku and item.sku == requested_sku for item in items)
     barcode_match = bool(barcode) and any(item.gtin and item.gtin == barcode for item in items)
-    if not catalog_match and not barcode_match:
+
+    if not catalog_match:
         return None
-    matched = next((item for item in items if item.sku == requested_sku or (barcode and item.gtin == barcode)), None)
+
+    matched = next((item for item in items if item.sku == requested_sku), None)
+    if matched is None:
+        return None
+
     return authority.issue(
-        session_id=session_id, frame_id=frame_id, requested_sku=requested_sku,
-        detected_sku=matched.sku if matched else detected_sku,
-        barcode_match=barcode_match, catalog_match=catalog_match,
+        session_id=session_id,
+        frame_id=frame_id,
+        requested_sku=requested_sku,
+        detected_sku=matched.sku,
+        barcode_match=barcode_match,
+        catalog_match=True,
     )
