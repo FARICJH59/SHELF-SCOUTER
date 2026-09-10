@@ -81,7 +81,11 @@ class TrustedEvidenceAuthority:
         if not self._secret:
             return False
         current = int(time.time() if now is None else now)
-        if evidence.issuer != self.issuer or current > evidence.expires_at or evidence.expires_at < evidence.issued_at:
+        if evidence.issuer != self.issuer:
+            return False
+        if current < evidence.issued_at:
+            return False
+        if current > evidence.expires_at or evidence.expires_at < evidence.issued_at:
             return False
         payload = asdict(evidence)
         signature = payload.pop("signature")
