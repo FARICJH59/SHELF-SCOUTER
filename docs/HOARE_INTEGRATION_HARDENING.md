@@ -1,7 +1,7 @@
 # HOARE Integration Hardening
 
 **Design record:** 2026-09-10
-**Hardening update:** 2026-09-10T23:00Z
+**Hardening update:** 2026-09-10T10:50Z
 
 ## Trust boundary
 
@@ -9,7 +9,7 @@ The phone is an untrusted observation source. It must never receive `HOARE_INTER
 
 Trusted sequence:
 
-`PHONE → MOBILE GATEWAY → SERVER-SIDE PHYSICAL IDENTITY → AUTHORIZED RETAILER ADAPTER → TRUSTED PRODUCT EVIDENCE → HOARE ADMISSION → EXECUTION`
+`PHONE → MOBILE GATEWAY → SERVER-CONTROLLED IMAGE → SERVER BARCODE DECODER → AUTHORIZED RETAILER ADAPTER → TRUSTED PRODUCT EVIDENCE → HOARE ADMISSION → EXECUTION`
 
 ## Resource routing
 
@@ -23,13 +23,15 @@ A vision candidate is only an observation. A model-supplied SKU is not physical 
 
 The trusted evidence authority therefore requires an explicit server-side `physical_identity_verified` result before issuing signed evidence. The mobile gateway must not promote a client barcode, model SKU, OCR result, or catalog lookup into physical identity.
 
-The physical identity boundary now includes an injectable server-side barcode verifier. It consumes server-controlled image bytes and accepts identity only when a real decoder returns a barcode that exactly matches the authorized expected GTIN after strict GTIN normalization. Decoder failures, malformed output, missing image bytes, and missing expected GTIN fail closed.
+The physical identity boundary now includes a production `PyzbarBarcodeDecoder` backed by ZBar. The decoder consumes server-controlled image bytes and permits only retail barcode symbologies before the verifier compares the decoded value with the authorized expected GTIN. GTIN normalization is strict numeric normalization with check-digit validation. Decoder failures, malformed output, unsupported barcode types, missing image bytes, invalid GTINs, and missing expected GTIN fail closed.
 
-The verifier intentionally has no permissive default decoder. A deployment must supply a real barcode decoder/library or an independently validated physical-identity service. This prevents a missing dependency from becoming an authorization bypass.
+The expected GTIN is obtained from an exact authorized retailer-adapter SKU lookup. The client-provided barcode is never used as the expected GTIN and never participates in the trust decision.
+
+The Docker image installs the native `libzbar0` dependency required by pyzbar. The Python decoder import remains lazy so environments without ZBar, including constrained development environments, fail closed instead of silently authorizing physical identity.
 
 ## Server-controlled image handling
 
-The server receives and decodes the image during `/frames`. A future production integration must perform physical identity verification against those server-controlled bytes before they are discarded, then persist only the minimum trusted verification result needed for the frame. The client-provided barcode remains an observation and must never be substituted for the server decode.
+The server receives and decodes the image during `/frames`. The gateway performs physical identity verification against a lossless PNG serialization of that server-decoded image before the image is discarded. Only the boolean verification result and authorized GTIN are retained with the frame; raw image bytes are not persisted by this boundary.
 
 ## Evidence binding
 
@@ -37,7 +39,7 @@ When trusted evidence exists, it is bound to both `session_id` and `frame_id`, s
 
 ## Barcode fast path
 
-The fast-path module supports barcode observations, but the gateway must not treat a client-provided barcode as a trusted server-side barcode decode. A real server-side decoder can populate a trusted barcode observation and safely enable barcode-first routing only after exact GTIN comparison against authorized catalog data.
+The fast-path module supports barcode observations, but the gateway must not treat a client-provided barcode as a trusted server-side barcode decode. The server decoder operates independently on server-controlled image bytes. Barcode-first routing can only become trusted after exact GTIN comparison against authorized catalog data.
 
 ## Telemetry
 
