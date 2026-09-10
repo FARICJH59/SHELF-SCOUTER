@@ -20,8 +20,7 @@ export default function App() {
   async function startSession() {
     try {
       const response = await fetch(`${BACKEND_URL}/v1/sessions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ device_id: `phone-${Date.now()}`, retailer: 'catalog' })
       });
       const data = await response.json();
@@ -52,9 +51,19 @@ export default function App() {
 
   async function confirmPick() {
     const candidate = result?.pick_match?.candidate;
-    if (!candidate || !sessionId) return;
+    if (!candidate || !candidate.sku || !sessionId) return;
     setBusy(true);
     try {
+      setStatus('Requesting trusted retailer verification…');
+      const verifyResponse = await fetch(`${BACKEND_URL}/v1/sessions/${sessionId}/verify`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_frame_id: result.frame_id, sku: candidate.sku })
+      });
+      const verification = await verifyResponse.json();
+      if (!verifyResponse.ok || verification.verified !== true) {
+        throw new Error(verification.reason || `Verification HTTP ${verifyResponse.status}`);
+      }
+      setStatus('Identity verified — requesting HOARE admission…');
       const response = await fetch(`${BACKEND_URL}/v1/sessions/${sessionId}/pick`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -68,7 +77,7 @@ export default function App() {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
       setStatus(`PICK CONFIRMED — ${data.quantity} × ${data.product}`);
-    } catch (error) { setStatus(`Pick failed: ${error.message}`); }
+    } catch (error) { setStatus(`Pick blocked: ${error.message}`); }
     finally { setBusy(false); }
   }
 
@@ -87,9 +96,7 @@ export default function App() {
     </View>
     <View style={styles.cameraWrap}>
       <CameraView
-        ref={cameraRef}
-        style={styles.camera}
-        facing="back"
+        ref={cameraRef} style={styles.camera} facing="back"
         barcodeScannerSettings={{ barcodeTypes: ['ean13', 'ean8', 'upc_a', 'upc_e', 'code128'] }}
         onBarcodeScanned={barcode ? undefined : ({ data }) => setBarcode(data)}
       />
@@ -102,7 +109,7 @@ export default function App() {
         <Text style={styles.resultTitle}>VERIFY ITEM</Text>
         <Text style={styles.item}>{candidate.name}</Text>
         <Text style={styles.meta}>Position: {candidate.shelf_position || 'unknown'} · Qty visible: {candidate.quantity ?? 'unknown'}</Text>
-        <Button title="CONFIRM PICK" onPress={confirmPick} disabled={busy} />
+        <Button title="VERIFY + CONFIRM PICK" onPress={confirmPick} disabled={busy || !candidate.sku} />
       </View>}
       {result?.pick_match && !candidate && <Text style={styles.notFound}>No confident match. Keep scanning.</Text>}
       {sessionId && <Text style={styles.session}>Session: {sessionId.slice(0, 8)} · Barcode: {barcode || 'not captured'}</Text>}
