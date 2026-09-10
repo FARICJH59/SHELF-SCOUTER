@@ -34,12 +34,7 @@ class TrustedProductEvidence:
 
 
 class TrustedEvidenceAuthority:
-    """Issue and verify tamper-evident evidence on the server side.
-
-    The public/mobile request path must never call ``issue`` directly with
-    client assertions. A trusted application path must first establish the
-    matches from an authorized retailer adapter.
-    """
+    """Issue and verify tamper-evident evidence on the server side."""
 
     def __init__(self, secret: str | bytes | None = None, *, issuer: str = "shelf-scouter-trusted-evidence", ttl_seconds: int = 300):
         raw = secret if secret is not None else os.getenv("HOARE_TRUSTED_EVIDENCE_SECRET")
@@ -64,19 +59,13 @@ class TrustedEvidenceAuthority:
               detected_sku: str | None, barcode_match: bool, catalog_match: bool,
               visual_match: bool = False, ocr_match: bool = False,
               now: int | None = None) -> TrustedProductEvidence:
-        """Issue evidence after the caller has performed trusted verification."""
         issued = int(time.time() if now is None else now)
         payload = {
-            "session_id": session_id,
-            "frame_id": frame_id,
-            "requested_sku": requested_sku,
-            "detected_sku": detected_sku,
-            "barcode_match": bool(barcode_match),
-            "catalog_match": bool(catalog_match),
-            "visual_match": bool(visual_match),
-            "ocr_match": bool(ocr_match),
-            "issuer": self.issuer,
-            "issued_at": issued,
+            "session_id": session_id, "frame_id": frame_id,
+            "requested_sku": requested_sku, "detected_sku": detected_sku,
+            "barcode_match": bool(barcode_match), "catalog_match": bool(catalog_match),
+            "visual_match": bool(visual_match), "ocr_match": bool(ocr_match),
+            "issuer": self.issuer, "issued_at": issued,
             "expires_at": issued + self.ttl_seconds,
         }
         return TrustedProductEvidence(**payload, signature=self._sign(payload))
@@ -89,32 +78,25 @@ class TrustedEvidenceAuthority:
             return False
         payload = asdict(evidence)
         signature = payload.pop("signature")
-        expected = self._sign(payload)
-        return hmac.compare_digest(signature, expected)
+        return hmac.compare_digest(signature, self._sign(payload))
 
 
 def verify_against_adapter(*, authority: TrustedEvidenceAuthority, adapter: RetailerAdapter,
                            session_id: str, frame_id: str, requested_sku: str,
-                           detected_sku: str | None, barcode: str | None) -> TrustedProductEvidence | None:
-    """Create trusted evidence only from an authorized adapter lookup.
-
-    No catalog match means no evidence is issued. This intentionally produces
-    ESCALATE/UNKNOWN rather than allowing the mobile client to self-assert a match.
-    """
+                           detected_sku: str | None, barcode: str | None,
+                           store_id: str | None = None) -> TrustedProductEvidence | None:
+    """Issue evidence only when an authorized adapter establishes a match."""
     if not authority.configured:
         return None
     query = detected_sku or requested_sku
-    items = adapter.resolve_item(query=query, store_id=None, barcode=barcode)
+    items = adapter.resolve_item(query=query, store_id=store_id, barcode=barcode)
     catalog_match = any(item.sku and item.sku == requested_sku for item in items)
     barcode_match = bool(barcode) and any(item.gtin and item.gtin == barcode for item in items)
     if not catalog_match and not barcode_match:
         return None
-    matched = next((item for item in items if item.sku == requested_sku or item.gtin == barcode), None)
+    matched = next((item for item in items if item.sku == requested_sku or (barcode and item.gtin == barcode)), None)
     return authority.issue(
-        session_id=session_id,
-        frame_id=frame_id,
-        requested_sku=requested_sku,
+        session_id=session_id, frame_id=frame_id, requested_sku=requested_sku,
         detected_sku=matched.sku if matched else detected_sku,
-        barcode_match=barcode_match,
-        catalog_match=catalog_match,
+        barcode_match=barcode_match, catalog_match=catalog_match,
     )
