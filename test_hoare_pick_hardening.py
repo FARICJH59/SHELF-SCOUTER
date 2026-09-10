@@ -41,8 +41,7 @@ def test_latency_p95_is_aggregate(monkeypatch):
         monkeypatch.setattr("execution_feedback.perf_counter", lambda: 0.001)
         executions.append(recorder.complete(execution.execution_id, success=True))
 
-    # Make the completed records deterministic and non-identical. The nearest-rank
-    # P95 of 1..20 is 20, proving telemetry is not copied from the selected record.
+    # Nearest-rank P95 of 1..20 is rank ceil(0.95 * 20) = 19.
     for index, execution in enumerate(executions, start=1):
         execution.latency_ms = float(index)
 
