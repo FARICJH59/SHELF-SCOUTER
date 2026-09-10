@@ -52,51 +52,59 @@ def test_client_barcode_does_not_override_missing_physical_verification():
 
 
 def test_gateway_rejects_trusted_evidence_replayed_to_another_frame_or_session():
-    authority = TrustedEvidenceAuthority("test-secret", ttl_seconds=60)
-    mobile_gateway._EVIDENCE_AUTHORITY = authority
-    evidence = authority.issue(
-        session_id="session-a",
-        frame_id="frame-a",
-        requested_sku="SKU-1",
-        detected_sku="SKU-1",
-        barcode_match=True,
-        catalog_match=True,
-        visual_match=True,
-        now=100,
-    )
-    trusted = asdict(evidence)
+    original_authority = mobile_gateway._EVIDENCE_AUTHORITY
+    try:
+        authority = TrustedEvidenceAuthority("test-secret", ttl_seconds=60)
+        mobile_gateway._EVIDENCE_AUTHORITY = authority
+        evidence = authority.issue(
+            session_id="session-a",
+            frame_id="frame-a",
+            requested_sku="SKU-1",
+            detected_sku="SKU-1",
+            barcode_match=True,
+            catalog_match=True,
+            visual_match=True,
+            now=100,
+        )
+        trusted = asdict(evidence)
 
-    valid_frame = {
-        "session_id": "session-a",
-        "frame_id": "frame-a",
-        "trusted_evidence": trusted,
-    }
-    assert mobile_gateway._trusted_evidence_from_frame(valid_frame) == evidence
+        valid_frame = {
+            "session_id": "session-a",
+            "frame_id": "frame-a",
+            "trusted_evidence": trusted,
+        }
+        assert mobile_gateway._trusted_evidence_from_frame(valid_frame) == evidence
 
-    replayed_frame = {
-        "session_id": "session-b",
-        "frame_id": "frame-b",
-        "trusted_evidence": trusted,
-    }
-    assert mobile_gateway._trusted_evidence_from_frame(replayed_frame) is None
+        replayed_frame = {
+            "session_id": "session-b",
+            "frame_id": "frame-b",
+            "trusted_evidence": trusted,
+        }
+        assert mobile_gateway._trusted_evidence_from_frame(replayed_frame) is None
+    finally:
+        mobile_gateway._EVIDENCE_AUTHORITY = original_authority
 
 
 def test_gateway_rejects_evidence_with_same_session_but_different_frame():
-    authority = TrustedEvidenceAuthority("test-secret", ttl_seconds=60)
-    mobile_gateway._EVIDENCE_AUTHORITY = authority
-    evidence = authority.issue(
-        session_id="session-a",
-        frame_id="frame-a",
-        requested_sku="SKU-1",
-        detected_sku="SKU-1",
-        barcode_match=True,
-        catalog_match=True,
-        visual_match=True,
-        now=100,
-    )
-    replayed = {
-        "session_id": "session-a",
-        "frame_id": "frame-b",
-        "trusted_evidence": asdict(evidence),
-    }
-    assert mobile_gateway._trusted_evidence_from_frame(replayed) is None
+    original_authority = mobile_gateway._EVIDENCE_AUTHORITY
+    try:
+        authority = TrustedEvidenceAuthority("test-secret", ttl_seconds=60)
+        mobile_gateway._EVIDENCE_AUTHORITY = authority
+        evidence = authority.issue(
+            session_id="session-a",
+            frame_id="frame-a",
+            requested_sku="SKU-1",
+            detected_sku="SKU-1",
+            barcode_match=True,
+            catalog_match=True,
+            visual_match=True,
+            now=100,
+        )
+        replayed = {
+            "session_id": "session-a",
+            "frame_id": "frame-b",
+            "trusted_evidence": asdict(evidence),
+        }
+        assert mobile_gateway._trusted_evidence_from_frame(replayed) is None
+    finally:
+        mobile_gateway._EVIDENCE_AUTHORITY = original_authority
