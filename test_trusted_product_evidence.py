@@ -1,6 +1,9 @@
-from trusted_product_evidence import TrustedEvidenceAuthority, TrustedProductEvidence, verify_against_adapter
+from physical_identity_verifier import (
+    RejectByDefaultPhysicalIdentityVerifier,
+    ServerBarcodePhysicalIdentityVerifier,
+)
 from retailer_adapters import CatalogOnlyAdapter
-from physical_identity_verifier import RejectByDefaultPhysicalIdentityVerifier
+from trusted_product_evidence import TrustedEvidenceAuthority, TrustedProductEvidence, verify_against_adapter
 
 
 def test_client_cannot_forge_trusted_evidence():
@@ -95,3 +98,31 @@ def test_mismatched_detected_sku_cannot_issue_evidence():
 def test_default_physical_verifier_fails_closed():
     verifier = RejectByDefaultPhysicalIdentityVerifier()
     assert verifier.verify(image_bytes=b"frame", requested_sku="SKU-1", expected_gtin="0001") is False
+
+
+def test_server_barcode_verifier_requires_exact_expected_gtin():
+    class Decoder:
+        def decode(self, image_bytes):
+            assert image_bytes == b"server-frame"
+            return ["00012345678905"]
+
+    verifier = ServerBarcodePhysicalIdentityVerifier(Decoder())
+    assert verifier.verify(
+        image_bytes=b"server-frame", requested_sku="SKU-1", expected_gtin="012345678905"
+    ) is True
+    assert verifier.verify(
+        image_bytes=b"server-frame", requested_sku="SKU-1", expected_gtin="012345678906"
+    ) is False
+
+
+def test_server_barcode_verifier_fails_closed_on_decoder_error():
+    def decoder(_image_bytes):
+        raise RuntimeError("decoder unavailable")
+
+    verifier = ServerBarcodePhysicalIdentityVerifier(decoder)
+    assert verifier.verify(image_bytes=b"server-frame", requested_sku="SKU-1", expected_gtin="012345678905") is False
+
+
+def test_server_barcode_verifier_rejects_malformed_decoder_output():
+    verifier = ServerBarcodePhysicalIdentityVerifier(lambda _image_bytes: ["not-a-gtin", 123])
+    assert verifier.verify(image_bytes=b"server-frame", requested_sku="SKU-1", expected_gtin="012345678905") is False
