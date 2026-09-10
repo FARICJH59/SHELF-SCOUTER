@@ -1,9 +1,8 @@
 """Server-side physical identity verification boundary for SHELF-SCOUTER.
 
-The phone and vision model are observation sources only. This module provides
-an injectable server-side barcode/physical-identity verifier without shipping
-a permissive fallback. A deployment must supply a real decoder/verifier that
-operates on server-controlled image bytes.
+The phone and vision model are observation sources only. Physical identity is
+proved from server-controlled image bytes by an independently executed barcode
+decoder and an authorized expected GTIN.
 
 Trust rule:
     image bytes -> independent physical identity -> authorized catalog -> HOARE
@@ -13,6 +12,7 @@ physical identity proof.
 """
 from __future__ import annotations
 
+from io import BytesIO
 from typing import Callable, Protocol
 
 
@@ -29,20 +29,51 @@ class BarcodeDecoder(Protocol):
 
 
 class RejectByDefaultPhysicalIdentityVerifier:
-    """Fail-closed verifier used until a real server-side verifier is installed."""
+    """Fail-closed verifier used when no production decoder is installed."""
 
     def verify(self, *, image_bytes: bytes, requested_sku: str, expected_gtin: str | None = None) -> bool:
         return False
 
 
+class PyzbarBarcodeDecoder:
+    """Decode retail barcodes with pyzbar/ZBar from server-controlled bytes.
+
+    pyzbar requires the native ZBar shared library on non-Windows systems.
+    The import is intentionally lazy so environments without ZBar remain
+    fail-closed instead of turning a missing native dependency into trust.
+    """
+
+    def decode(self, image_bytes: bytes) -> list[str]:
+        if not image_bytes:
+            return []
+        try:
+            from PIL import Image
+            from pyzbar.pyzbar import decode
+            with Image.open(BytesIO(image_bytes)) as image:
+                image.load()
+                decoded = decode(image)
+        except Exception:
+            return []
+        values: list[str] = []
+        for item in decoded:
+            try:
+                value = item.data.decode("ascii").strip()
+            except (AttributeError, UnicodeDecodeError):
+                continue
+            if value:
+                values.append(value)
+        return values
+
+
 class ServerBarcodePhysicalIdentityVerifier:
     """Verify physical identity from a server-side barcode decoder.
 
-    The decoder is injected deliberately: this boundary does not pretend that
-    an unavailable barcode library can prove identity. A deployment can supply
-    a production decoder such as a native barcode service/library. The verifier
-    only returns True when a decoded barcode exactly matches the authorized
-    expected GTIN. SKU authorization remains the responsibility of the retailer
+    The decoder is injected deliberately for deterministic testing and future
+    alternative implementations. Production can use ``PyzbarBarcodeDecoder``
+    while isolated environments can continue using the fail-closed verifier.
+    The verifier only returns True when a decoded barcode exactly matches the
+    authorized expected GTIN after strict normalization and check-digit
+    validation. SKU authorization remains the responsibility of the retailer
     adapter/evidence authority.
     """
 
@@ -50,7 +81,10 @@ class ServerBarcodePhysicalIdentityVerifier:
         self._decoder = decoder
 
     def verify(self, *, image_bytes: bytes, requested_sku: str, expected_gtin: str | None = None) -> bool:
-        if not image_bytes or not expected_gtin:
+        if not image_bytes or not expected_gtin or not requested_sku.strip():
+            return False
+        expected = _normalize_gtin(expected_gtin)
+        if not expected:
             return False
         try:
             raw_values = self._decoder.decode(image_bytes) if hasattr(self._decoder, "decode") else self._decoder(image_bytes)
@@ -58,15 +92,19 @@ class ServerBarcodePhysicalIdentityVerifier:
             return False
         if not isinstance(raw_values, list):
             return False
-        expected = _normalize_gtin(expected_gtin)
-        if not expected:
-            return False
         return any(_normalize_gtin(value) == expected for value in raw_values if isinstance(value, str))
 
 
 def _normalize_gtin(value: str) -> str:
-    """Normalize numeric GTIN observations without accepting arbitrary text."""
-    digits = "".join(ch for ch in value.strip() if ch.isdigit())
-    if not digits or len(digits) not in {8, 12, 13, 14}:
+    """Normalize and validate a numeric GTIN-8/12/13/14 value."""
+    raw = value.strip()
+    if not raw.isdigit() or len(raw) not in {8, 12, 13, 14}:
         return ""
-    return digits.zfill(14)
+    digits = raw.zfill(14)
+    check = sum(
+        int(char) * (3 if (len(digits) - 1 - index) % 2 == 0 else 1)
+        for index, char in enumerate(digits[:-1])
+    )
+    if (10 - (check % 10)) % 10 != int(digits[-1]):
+        return ""
+    return digits
