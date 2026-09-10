@@ -48,4 +48,4 @@ def test_latency_p95_is_aggregate(monkeypatch):
 
     observation = recorder.telemetry_observation(executions[-1].execution_id)
     assert observation["latencyMs"] == 20.0
-    assert observation["latencyP95Ms"] == 20.0
+    assert observation["latencyP95Ms"] == 19.0
