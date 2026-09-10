@@ -8,6 +8,8 @@ Security boundary:
 - Client requests may provide observations, but cannot self-authorize identity.
 - Product verification evidence is issued only by the server-side trusted
   evidence authority after an authorized retailer adapter lookup.
+- Physical identity is derived from server-controlled image bytes, never from
+  a client barcode or model claim.
 - Resource-route decisions are accepted either from a trusted internal caller
   or from the server-side HOARE route adapter; the phone never supplies an
   authoritative route decision.
@@ -17,6 +19,7 @@ Security boundary:
 import os
 from dataclasses import asdict
 from datetime import datetime, timezone
+from io import BytesIO
 from uuid import uuid4
 
 from flask import jsonify, request
@@ -29,14 +32,34 @@ from hoare_pick_admission import AdmissionDecision, PickRequest, ResourceRoute, 
 from execution_feedback import ExecutionFeedbackRecorder
 from trusted_product_evidence import TrustedEvidenceAuthority, TrustedProductEvidence, verify_against_adapter
 from hoare_resource_route import server_resource_route
+from physical_identity_verifier import PyzbarBarcodeDecoder, ServerBarcodePhysicalIdentityVerifier
 
 _feedback = ExecutionFeedbackRecorder()
 _EVIDENCE_AUTHORITY = TrustedEvidenceAuthority()
 _INTERNAL_ROUTE_TOKEN = os.getenv("HOARE_INTERNAL_ROUTE_TOKEN")
+_PHYSICAL_IDENTITY_VERIFIER = ServerBarcodePhysicalIdentityVerifier(PyzbarBarcodeDecoder())
 
 
 def _session(session_id):
     return _sessions.get(session_id)
+
+
+def _server_image_bytes(image) -> bytes:
+    """Serialize the server-decoded image losslessly for physical verification."""
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _authorized_gtin_for_sku(adapter, *, sku: str, store_id: str | None) -> str | None:
+    """Return GTIN only from an authorized adapter exact-SKU lookup."""
+    if not sku.strip():
+        return None
+    items = adapter.resolve_item(query=sku.strip(), store_id=store_id, barcode=None)
+    matches = [item for item in items if item.sku == sku.strip() and item.gtin]
+    if len(matches) != 1:
+        return None
+    return str(matches[0].gtin).strip() or None
 
 
 def _match_requested_item(result: dict, query: str | None, barcode: str | None = None) -> dict:
@@ -107,11 +130,7 @@ def _trusted_evidence_from_frame(frame: dict) -> TrustedProductEvidence | None:
 
 
 def _identity_from_frame(frame: dict, requested_sku: str | None = None):
-    """Build identity only from server-issued trusted evidence.
-
-    Vision names, client barcodes, and client ``verification`` fields remain
-    observations and can never produce VERIFIED identity for a pick.
-    """
+    """Build identity only from server-issued trusted evidence."""
     candidate = (frame.get("pick_match") or {}).get("candidate") or {}
     evidence = _trusted_evidence_from_frame(frame)
     if evidence is None or (requested_sku and evidence.requested_sku != requested_sku):
@@ -231,6 +250,25 @@ def v1_frame(session_id):
         return jsonify({"error": "Inference failed"}), 500
     match = _match_requested_item(result, payload.get("query"), payload.get("barcode"))
     match = _enrich_candidate_from_adapter(session, match)
+
+    physical_identity_verified = False
+    physical_identity_gtin = None
+    candidate = match.get("candidate") or {}
+    candidate_sku = str(candidate.get("sku") or "").strip()
+    if candidate_sku:
+        adapter = get_adapter(session.get("retailer"))
+        expected_gtin = _authorized_gtin_for_sku(
+            adapter, sku=candidate_sku, store_id=session.get("store_id")
+        )
+        if expected_gtin:
+            physical_identity_verified = _PHYSICAL_IDENTITY_VERIFIER.verify(
+                image_bytes=_server_image_bytes(image),
+                requested_sku=candidate_sku,
+                expected_gtin=expected_gtin,
+            )
+            if physical_identity_verified:
+                physical_identity_gtin = expected_gtin
+
     frame = {
         "frame_id": str(uuid4()), "session_id": session_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -239,6 +277,8 @@ def v1_frame(session_id):
         "orientation": payload.get("orientation"),
         "fast_path": {"route": route, "quality": fast.quality.__dict__, "image_sha256": fast.image_sha256, "normalized_size": fast.normalized_size},
         "result": result, "pick_match": match,
+        "physical_identity_verified": physical_identity_verified,
+        "physical_identity_gtin": physical_identity_gtin,
         "action": "VERIFY_IDENTITY" if match.get("found") else "KEEP_SCANNING",
     }
     session["frames"].append(frame)
@@ -286,6 +326,7 @@ def v1_verify(session_id):
         detected_sku=detected_sku,
         barcode=barcode,
         store_id=session.get("store_id"),
+        physical_identity_verified=bool(frame.get("physical_identity_verified", False)),
     )
     if evidence is None:
         return jsonify({
