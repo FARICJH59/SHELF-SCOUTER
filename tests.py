@@ -69,6 +69,10 @@ os.environ.setdefault("GOOGLE_API_KEY", "test-key")
 
 import app as shelf_app
 
+# Endpoint tests mock inference, so isolate them from the developer machine's
+# real Google API-key environment. Production app.py behavior is unchanged.
+shelf_app.GOOGLE_API_KEY = "test-key"
+
 
 def _make_b64_image() -> str:
     """Return a minimal valid PNG base64 string for endpoint tests."""
