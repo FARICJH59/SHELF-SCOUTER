@@ -1,5 +1,3 @@
-import os
-
 from execution_feedback import ExecutionFeedbackRecorder
 from hoare_resource_route import server_resource_route
 from hoare_pick_admission import AdmissionDecision
@@ -39,12 +37,15 @@ def test_latency_p95_is_aggregate(monkeypatch):
             tenant_id="tenant", order_id="order", requested_sku="SKU-1",
             provider="edge", region="edge-local", device_id="phone", model="vision",
         )
-        # Avoid sleeping: provide deterministic completed latency values.
         recorder._clocks[execution.execution_id] = 0.0
         monkeypatch.setattr("execution_feedback.perf_counter", lambda: 0.001)
         executions.append(recorder.complete(execution.execution_id, success=True))
 
+    # Make the completed records deterministic and non-identical. The nearest-rank
+    # P95 of 1..20 is 20, proving telemetry is not copied from the selected record.
+    for index, execution in enumerate(executions, start=1):
+        execution.latency_ms = float(index)
+
     observation = recorder.telemetry_observation(executions[-1].execution_id)
-    assert observation["latencyMs"] == 1.0
-    assert observation["latencyP95Ms"] == 1.0
-    assert observation["latencyP95Ms"] != None
+    assert observation["latencyMs"] == 20.0
+    assert observation["latencyP95Ms"] == 20.0
