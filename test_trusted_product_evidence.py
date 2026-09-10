@@ -1,5 +1,6 @@
 from trusted_product_evidence import TrustedEvidenceAuthority, TrustedProductEvidence, verify_against_adapter
 from retailer_adapters import CatalogOnlyAdapter
+from physical_identity_verifier import RejectByDefaultPhysicalIdentityVerifier
 
 
 def test_client_cannot_forge_trusted_evidence():
@@ -89,3 +90,8 @@ def test_mismatched_detected_sku_cannot_issue_evidence():
         physical_identity_verified=True,
     )
     assert evidence is None
+
+
+def test_default_physical_verifier_fails_closed():
+    verifier = RejectByDefaultPhysicalIdentityVerifier()
+    assert verifier.verify(image_bytes=b"frame", requested_sku="SKU-1", expected_gtin="0001") is False
