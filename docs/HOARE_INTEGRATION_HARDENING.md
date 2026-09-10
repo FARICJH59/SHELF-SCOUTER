@@ -18,13 +18,19 @@ For standalone development, `HOARE_SERVER_ROUTE_DECISION` may provide a server-s
 
 ## Product identity
 
-A vision candidate is only an observation until the authorized retailer adapter establishes the canonical SKU. Client barcode data remains an observation and cannot by itself create trusted evidence.
+A vision candidate is only an observation. A model-supplied SKU is not physical identity proof, even when the SKU exists in the authorized retailer catalog. Catalog existence establishes canonical metadata; it does not establish that the photographed object is that SKU.
 
-The `/verify` endpoint persists signed evidence on the source frame. Admission reconstructs and verifies that evidence before permitting `ALLOW`.
+The trusted evidence authority therefore requires an explicit server-side `physical_identity_verified` result before issuing signed evidence. The current mobile gateway does not have an independent physical verifier, so `/verify` remains fail-closed to `UNKNOWN`/`409` rather than promoting model output to trusted identity.
+
+A future trusted verifier can be a server-derived barcode decoder plus authorized catalog lookup, or an independently verified visual/physical identity service. Client-supplied barcode fields must remain observations unless independently re-derived on the server.
+
+## Evidence binding
+
+When trusted evidence exists, it is bound to both `session_id` and `frame_id`, signed by the server-side authority, and checked for expiry before HOARE admission. Evidence cannot be transferred to another session or source frame without invalidating the binding/signature.
 
 ## Barcode fast path
 
-The fast-path module supports barcode observations, but the gateway must not treat a client-provided barcode as a trusted server-side barcode decode. A future server-side decoder can populate the barcode observation and safely enable barcode-first routing.
+The fast-path module supports barcode observations, but the gateway must not treat a client-provided barcode as a trusted server-side barcode decode. A future server-side decoder can populate a trusted barcode observation and safely enable barcode-first routing.
 
 ## Telemetry
 
