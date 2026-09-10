@@ -36,29 +36,32 @@ def test_unconfigured_authority_issues_no_evidence():
     evidence = verify_against_adapter(
         authority=authority, adapter=adapter, session_id="session", frame_id="frame",
         requested_sku="SKU-1", detected_sku="SKU-1", barcode="0001",
+        physical_identity_verified=True,
     )
     assert evidence is None
 
 
-def test_authorized_adapter_can_issue_matching_evidence():
+def test_authorized_adapter_can_issue_matching_evidence_after_physical_verification():
     authority = TrustedEvidenceAuthority("test-secret")
     adapter = CatalogOnlyAdapter([{"sku": "SKU-1", "gtin": "0001", "name": "Item"}])
     evidence = verify_against_adapter(
         authority=authority, adapter=adapter, session_id="session", frame_id="frame",
         requested_sku="SKU-1", detected_sku="SKU-1", barcode="0001",
+        physical_identity_verified=True,
     )
     assert evidence is not None
     assert evidence.catalog_match is True
     assert evidence.barcode_match is True
+    assert evidence.visual_match is True
     assert authority.verify(evidence) is True
 
 
-def test_unmatched_adapter_cannot_issue_evidence():
+def test_catalog_valid_model_sku_without_physical_verification_cannot_issue_evidence():
     authority = TrustedEvidenceAuthority("test-secret")
-    adapter = CatalogOnlyAdapter([{"sku": "OTHER", "gtin": "9999", "name": "Other"}])
+    adapter = CatalogOnlyAdapter([{"sku": "SKU-1", "gtin": "0001", "name": "Item"}])
     evidence = verify_against_adapter(
         authority=authority, adapter=adapter, session_id="session", frame_id="frame",
-        requested_sku="SKU-1", detected_sku="SKU-1", barcode="0001",
+        requested_sku="SKU-1", detected_sku="SKU-1", barcode=None,
     )
     assert evidence is None
 
@@ -69,6 +72,7 @@ def test_client_barcode_alone_cannot_issue_evidence():
     evidence = verify_against_adapter(
         authority=authority, adapter=adapter, session_id="session", frame_id="frame",
         requested_sku="SKU-1", detected_sku=None, barcode="0001",
+        physical_identity_verified=True,
     )
     assert evidence is None
 
@@ -82,5 +86,6 @@ def test_mismatched_detected_sku_cannot_issue_evidence():
     evidence = verify_against_adapter(
         authority=authority, adapter=adapter, session_id="session", frame_id="frame",
         requested_sku="SKU-1", detected_sku="OTHER", barcode="0001",
+        physical_identity_verified=True,
     )
     assert evidence is None
