@@ -6,10 +6,10 @@ those observations with an authorized retailer adapter.
 
 Security rule:
 - A client-supplied barcode alone can NEVER establish trusted identity.
-- Until the gateway has a server-derived barcode observation, barcode matching
-  is supporting evidence only.
-- The current adapter path therefore requires the server-side vision candidate
-  SKU to exactly match the requested SKU before issuing evidence.
+- A model-supplied SKU is an observation, not physical identity proof.
+- Catalog existence alone is never enough to issue trusted evidence.
+- Evidence requires an explicit server-side physical identity verification
+  result. Until that verifier exists, the gateway must fail closed to ESCALATE.
 """
 from __future__ import annotations
 
@@ -91,18 +91,25 @@ class TrustedEvidenceAuthority:
 def verify_against_adapter(*, authority: TrustedEvidenceAuthority, adapter: RetailerAdapter,
                            session_id: str, frame_id: str, requested_sku: str,
                            detected_sku: str | None, barcode: str | None,
-                           store_id: str | None = None) -> TrustedProductEvidence | None:
-    """Issue evidence only when an authorized adapter establishes a frame-linked match.
+                           store_id: str | None = None,
+                           physical_identity_verified: bool = False) -> TrustedProductEvidence | None:
+    """Issue evidence only after independent server-side physical verification.
 
-    ``barcode`` is currently an untrusted client observation. It may contribute
-    to the returned evidence only after the server-side candidate SKU already
-    matches the requested SKU. This prevents an attacker from supplying a known
-    GTIN for an unrelated product and obtaining VERIFIED identity.
+    ``detected_sku`` and ``barcode`` are observations. The authorized adapter
+    can establish that a SKU exists, but it cannot by itself prove that the
+    physical product in this frame is that SKU. ``physical_identity_verified``
+    must therefore come from a trusted server-side verifier (for example a
+    server-derived barcode decoder plus catalog lookup, or an independently
+    verified visual/physical identity service).
 
-    A future server-derived barcode decoder can safely strengthen this path by
-    passing a trusted barcode observation and allowing barcode-only verification.
+    The default is deliberately fail-closed. The current mobile gateway does
+    not have such a verifier yet, so its ``/verify`` path cannot issue trusted
+    evidence even when a model happens to return a catalog-valid SKU.
     """
     if not authority.configured:
+        return None
+
+    if not physical_identity_verified:
         return None
 
     if not detected_sku or detected_sku != requested_sku:
@@ -126,4 +133,5 @@ def verify_against_adapter(*, authority: TrustedEvidenceAuthority, adapter: Reta
         detected_sku=matched.sku,
         barcode_match=barcode_match,
         catalog_match=True,
+        visual_match=True,
     )
