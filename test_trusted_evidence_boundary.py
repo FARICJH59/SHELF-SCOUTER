@@ -1,3 +1,4 @@
+import time
 from dataclasses import asdict
 
 import mobile_gateway
@@ -56,6 +57,7 @@ def test_gateway_rejects_trusted_evidence_replayed_to_another_frame_or_session()
     try:
         authority = TrustedEvidenceAuthority("test-secret", ttl_seconds=60)
         mobile_gateway._EVIDENCE_AUTHORITY = authority
+        now = int(time.time())
         evidence = authority.issue(
             session_id="session-a",
             frame_id="frame-a",
@@ -64,7 +66,7 @@ def test_gateway_rejects_trusted_evidence_replayed_to_another_frame_or_session()
             barcode_match=True,
             catalog_match=True,
             visual_match=True,
-            now=100,
+            now=now,
         )
         trusted = asdict(evidence)
 
@@ -90,6 +92,7 @@ def test_gateway_rejects_evidence_with_same_session_but_different_frame():
     try:
         authority = TrustedEvidenceAuthority("test-secret", ttl_seconds=60)
         mobile_gateway._EVIDENCE_AUTHORITY = authority
+        now = int(time.time())
         evidence = authority.issue(
             session_id="session-a",
             frame_id="frame-a",
@@ -98,7 +101,7 @@ def test_gateway_rejects_evidence_with_same_session_but_different_frame():
             barcode_match=True,
             catalog_match=True,
             visual_match=True,
-            now=100,
+            now=now,
         )
         replayed = {
             "session_id": "session-a",
