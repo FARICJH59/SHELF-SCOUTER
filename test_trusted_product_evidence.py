@@ -1,4 +1,5 @@
 from physical_identity_verifier import (
+    PyzbarBarcodeDecoder,
     RejectByDefaultPhysicalIdentityVerifier,
     ServerBarcodePhysicalIdentityVerifier,
 )
@@ -115,6 +116,20 @@ def test_server_barcode_verifier_requires_exact_expected_gtin():
     ) is False
 
 
+def test_server_barcode_verifier_rejects_invalid_gtin_check_digit():
+    verifier = ServerBarcodePhysicalIdentityVerifier(lambda _image_bytes: ["012345678906"])
+    assert verifier.verify(
+        image_bytes=b"server-frame", requested_sku="SKU-1", expected_gtin="012345678906"
+    ) is False
+
+
+def test_server_barcode_verifier_requires_numeric_gtin():
+    verifier = ServerBarcodePhysicalIdentityVerifier(lambda _image_bytes: ["GTIN:012345678905"])
+    assert verifier.verify(
+        image_bytes=b"server-frame", requested_sku="SKU-1", expected_gtin="012345678905"
+    ) is False
+
+
 def test_server_barcode_verifier_fails_closed_on_decoder_error():
     def decoder(_image_bytes):
         raise RuntimeError("decoder unavailable")
@@ -126,3 +141,7 @@ def test_server_barcode_verifier_fails_closed_on_decoder_error():
 def test_server_barcode_verifier_rejects_malformed_decoder_output():
     verifier = ServerBarcodePhysicalIdentityVerifier(lambda _image_bytes: ["not-a-gtin", 123])
     assert verifier.verify(image_bytes=b"server-frame", requested_sku="SKU-1", expected_gtin="012345678905") is False
+
+
+def test_pyzbar_decoder_fails_closed_when_decoder_unavailable_or_input_invalid():
+    assert PyzbarBarcodeDecoder().decode(b"not-an-image") == []
