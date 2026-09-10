@@ -8,7 +8,9 @@ Security boundary:
 - Client requests may provide observations, but cannot self-authorize identity.
 - Product verification evidence is issued only by the server-side trusted
   evidence authority after an authorized retailer adapter lookup.
-- Resource-route decisions are accepted only from a trusted internal caller.
+- Resource-route decisions are accepted either from a trusted internal caller
+  or from the server-side HOARE route adapter; the phone never supplies an
+  authoritative route decision.
 - Missing or invalid trusted evidence/route escalates rather than assuming ALLOW.
 """
 
@@ -26,6 +28,7 @@ from product_verification import ProductEvidence, verify_product, identity_summa
 from hoare_pick_admission import AdmissionDecision, PickRequest, ResourceRoute, admit_pick
 from execution_feedback import ExecutionFeedbackRecorder
 from trusted_product_evidence import TrustedEvidenceAuthority, TrustedProductEvidence, verify_against_adapter
+from hoare_resource_route import server_resource_route
 
 _feedback = ExecutionFeedbackRecorder()
 _EVIDENCE_AUTHORITY = TrustedEvidenceAuthority()
@@ -37,7 +40,7 @@ def _session(session_id):
 
 
 def _match_requested_item(result: dict, query: str | None, barcode: str | None = None) -> dict:
-    """Return a deterministic candidate; never treat it as verified identity."""
+    """Return a deterministic vision candidate; never treat it as verified identity."""
     products = result.get("products", [])
     q = (query or "").strip().lower()
     candidates = []
@@ -59,6 +62,28 @@ def _match_requested_item(result: dict, query: str | None, barcode: str | None =
     if not candidates:
         return {"found": False, "action": "KEEP_SCANNING", "candidate": None}
     return {"found": True, "action": "VERIFY_AND_PICK", "candidate": candidates[0][1], "score": candidates[0][0]}
+
+
+def _enrich_candidate_from_adapter(session: dict, match: dict) -> dict:
+    """Attach canonical retailer identifiers without turning them into trust evidence."""
+    candidate = match.get("candidate")
+    if not isinstance(candidate, dict):
+        return match
+    if candidate.get("sku"):
+        return match
+    query = str(candidate.get("name") or candidate.get("label_text") or "").strip()
+    if not query:
+        return match
+    adapter = get_adapter(session.get("retailer"))
+    items = adapter.resolve_item(query=query, store_id=session.get("store_id"), barcode=None)
+    if len(items) != 1 or not items[0].sku:
+        return match
+    enriched = dict(candidate)
+    enriched["sku"] = items[0].sku
+    if items[0].gtin:
+        enriched["gtin"] = items[0].gtin
+    enriched["retailer_catalog_match"] = True
+    return {**match, "candidate": enriched}
 
 
 def _trusted_evidence_from_frame(frame: dict) -> TrustedProductEvidence | None:
@@ -114,12 +139,9 @@ def _identity_from_frame(frame: dict, requested_sku: str | None = None):
     )
 
 
-def _trusted_resource_route(payload: dict) -> ResourceRoute:
-    """Accept a route decision only from a trusted internal HOARE caller."""
+def _route_from_payload(payload: dict) -> ResourceRoute:
+    """Validate a route supplied by the trusted internal HOARE caller."""
     route_payload = payload.get("resource_route") or {}
-    token = request.headers.get("X-HOARE-Internal-Route-Token")
-    if not _INTERNAL_ROUTE_TOKEN or token != _INTERNAL_ROUTE_TOKEN:
-        return ResourceRoute(decision=AdmissionDecision.ESCALATE, reason=["trusted_resource_authority_required"])
     try:
         decision = AdmissionDecision(str(route_payload.get("decision", "ESCALATE")))
     except ValueError:
@@ -134,6 +156,16 @@ def _trusted_resource_route(payload: dict) -> ResourceRoute:
         predicted_latency_ms=route_payload.get("predicted_latency_ms"),
         reason=reason,
     )
+
+
+def _trusted_resource_route(payload: dict, *, allow_server_route: bool = False) -> ResourceRoute:
+    """Accept a route only from trusted internal HOARE or server-side authority."""
+    token = request.headers.get("X-HOARE-Internal-Route-Token")
+    if _INTERNAL_ROUTE_TOKEN and token == _INTERNAL_ROUTE_TOKEN:
+        return _route_from_payload(payload)
+    if allow_server_route:
+        return server_resource_route()
+    return ResourceRoute(decision=AdmissionDecision.ESCALATE, reason=["trusted_resource_authority_required"])
 
 
 @app.get("/v1/health")
@@ -198,6 +230,7 @@ def v1_frame(session_id):
     except Exception:
         return jsonify({"error": "Inference failed"}), 500
     match = _match_requested_item(result, payload.get("query"), payload.get("barcode"))
+    match = _enrich_candidate_from_adapter(session, match)
     frame = {
         "frame_id": str(uuid4()), "session_id": session_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -303,12 +336,15 @@ def v1_pick(session_id):
     if not frame:
         return jsonify({"error": "Source frame not found"}), 404
     identity = _identity_from_frame(frame, requested_sku)
-    route = _trusted_resource_route(payload)
+    route = _trusted_resource_route(payload, allow_server_route=True)
     admission = admit_pick(PickRequest(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, device_id=session.get("device_id") or "unknown", store_id=session.get("store_id"), aisle=payload.get("aisle"), shelf=payload.get("shelf")), identity, route)
     if admission.decision is not AdmissionDecision.ALLOW:
         code = 409 if admission.decision is AdmissionDecision.ESCALATE else 403
         return jsonify({"status": admission.decision.value, "reasons": admission.reasons, "identity": identity_summary(identity), "resource_route": route.__dict__, "action": "RECAPTURE_OR_TARGETED_VERIFICATION" if admission.decision is AdmissionDecision.ESCALATE else "STOP"}), code
-    quantity = int(payload.get("quantity", 1))
+    try:
+        quantity = int(payload.get("quantity", 1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "quantity must be an integer"}), 400
     if quantity < 1:
         return jsonify({"error": "quantity must be >= 1"}), 400
     execution = _feedback.start(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, provider=route.provider or payload.get("provider", "edge"), region=route.region or payload.get("region", "edge-local"), device_id=session.get("device_id") or "unknown", model=(frame.get("result") or {}).get("model", "targeted-vision"))
