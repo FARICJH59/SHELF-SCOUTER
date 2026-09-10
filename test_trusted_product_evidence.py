@@ -61,3 +61,26 @@ def test_unmatched_adapter_cannot_issue_evidence():
         requested_sku="SKU-1", detected_sku="SKU-1", barcode="0001",
     )
     assert evidence is None
+
+
+def test_client_barcode_alone_cannot_issue_evidence():
+    authority = TrustedEvidenceAuthority("test-secret")
+    adapter = CatalogOnlyAdapter([{"sku": "SKU-1", "gtin": "0001", "name": "Item"}])
+    evidence = verify_against_adapter(
+        authority=authority, adapter=adapter, session_id="session", frame_id="frame",
+        requested_sku="SKU-1", detected_sku=None, barcode="0001",
+    )
+    assert evidence is None
+
+
+def test_mismatched_detected_sku_cannot_issue_evidence():
+    authority = TrustedEvidenceAuthority("test-secret")
+    adapter = CatalogOnlyAdapter([
+        {"sku": "SKU-1", "gtin": "0001", "name": "Item"},
+        {"sku": "OTHER", "gtin": "9999", "name": "Other"},
+    ])
+    evidence = verify_against_adapter(
+        authority=authority, adapter=adapter, session_id="session", frame_id="frame",
+        requested_sku="SKU-1", detected_sku="OTHER", barcode="0001",
+    )
+    assert evidence is None
