@@ -43,6 +43,8 @@ class PyzbarBarcodeDecoder:
     fail-closed instead of turning a missing native dependency into trust.
     """
 
+    _ALLOWED_TYPES = {"EAN13", "EAN8", "UPCA", "UPCE", "I25", "CODE128"}
+
     def decode(self, image_bytes: bytes) -> list[str]:
         if not image_bytes:
             return []
@@ -56,6 +58,8 @@ class PyzbarBarcodeDecoder:
             return []
         values: list[str] = []
         for item in decoded:
+            if str(getattr(item, "type", "")).upper() not in self._ALLOWED_TYPES:
+                continue
             try:
                 value = item.data.decode("ascii").strip()
             except (AttributeError, UnicodeDecodeError):
@@ -71,10 +75,10 @@ class ServerBarcodePhysicalIdentityVerifier:
     The decoder is injected deliberately for deterministic testing and future
     alternative implementations. Production can use ``PyzbarBarcodeDecoder``
     while isolated environments can continue using the fail-closed verifier.
-    The verifier only returns True when a decoded barcode exactly matches the
-    authorized expected GTIN after strict normalization and check-digit
-    validation. SKU authorization remains the responsibility of the retailer
-    adapter/evidence authority.
+    The verifier only returns True when a decoded retail barcode exactly
+    matches the authorized expected GTIN after strict normalization and
+    check-digit validation. SKU authorization remains the responsibility of
+    the retailer adapter/evidence authority.
     """
 
     def __init__(self, decoder: BarcodeDecoder | Callable[[bytes], list[str]]):
