@@ -2,6 +2,7 @@
 
 **Design record:** 2026-09-10
 **Hardening update:** 2026-09-10T10:50Z
+**Resource-authority update:** 2026-09-10T12:00Z
 
 ## Trust boundary
 
@@ -15,7 +16,15 @@ Trusted sequence:
 
 Production resource routing is supplied by a trusted server-side HOARE orchestrator. The mobile client does not submit an authoritative route decision.
 
-For standalone development, `HOARE_SERVER_ROUTE_DECISION` may provide a server-side route decision. Its default is `ESCALATE`; it is not a replacement for the production HOARE resource router.
+The production adapter is enabled with `HOARE_RESOURCE_AUTHORITY_URL`. The gateway sends server-derived execution context to that endpoint and may optionally authenticate with `HOARE_RESOURCE_AUTHORITY_TOKEN`. The authority response must contain a decision of `ALLOW`, `DENY`, or `ESCALATE`. An `ALLOW` response must also contain both `provider` and `region`; otherwise the response is converted to `DENY`.
+
+The authority request contains tenant, order, requested SKU, device, store, optional aisle/shelf, source frame, and an `identity_verified` flag. The client `resource_route` object is never forwarded as an authoritative route to the production authority.
+
+Authority transport failures and non-2xx failures other than authentication/authorization failures produce `ESCALATE`. Authentication/authorization failures produce `DENY`. Invalid authority schemas, invalid decisions, invalid targets, and invalid latency values produce `DENY`. Production HTTP is rejected unless `HOARE_RESOURCE_AUTHORITY_ALLOW_HTTP=true`; HTTPS is the expected deployment transport.
+
+`HOARE_RESOURCE_AUTHORITY_TIMEOUT_SECONDS` defaults to 2 seconds and is bounded to 10 seconds. This prevents a routing dependency from becoming an unbounded execution stall.
+
+For standalone development, `HOARE_SERVER_ROUTE_DECISION` may provide a server-side route decision. Its default is `ESCALATE`; it is not a replacement for the production HOARE resource router. When `HOARE_RESOURCE_AUTHORITY_URL` is configured, the production authority takes precedence over the development route variables.
 
 ## Product identity
 
