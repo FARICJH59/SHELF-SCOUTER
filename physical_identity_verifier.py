@@ -105,8 +105,10 @@ def _normalize_gtin(value: str) -> str:
     if not raw.isdigit() or len(raw) not in {8, 12, 13, 14}:
         return ""
     digits = raw.zfill(14)
+    # GS1: starting immediately left of the check digit, apply
+    # weights 3, 1, 3, 1... moving from right to left.
     check = sum(
-        int(char) * (3 if (len(digits) - 1 - index) % 2 == 0 else 1)
+        int(char) * (3 if (len(digits) - 2 - index) % 2 == 0 else 1)
         for index, char in enumerate(digits[:-1])
     )
     if (10 - (check % 10)) % 10 != int(digits[-1]):
