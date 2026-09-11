@@ -23,6 +23,7 @@ from io import BytesIO
 from uuid import uuid4
 
 from flask import jsonify, request
+from PIL import Image
 
 from app import app, scan_shelf_image, _decode_image, _sessions, GOOGLE_API_KEY
 from retailer_adapters import get_adapter
@@ -224,12 +225,32 @@ def v1_frame(session_id):
         return jsonify({"error": "Session not found"}), 404
     if not GOOGLE_API_KEY:
         return jsonify({"error": "GOOGLE_API_KEY not configured"}), 503
+    # Accept both the original JSON/base64 request and phone-native
+    # multipart/form-data uploads. Image decoding remains server-side.
     payload = request.get_json(silent=True) or {}
-    image_data = payload.get("image")
-    if not image_data:
-        return jsonify({"error": "Missing 'image' field"}), 400
+
+    image_file = request.files.get("image")
+    if image_file is not None:
+        image_data = image_file.read()
+        if not image_data:
+            return jsonify({"error": "Empty 'image' upload"}), 400
+
+        # Preserve optional request metadata supplied as multipart fields.
+        for field in ("query", "barcode", "gps", "qgps", "orientation"):
+            value = request.form.get(field)
+            if value is not None:
+                payload[field] = value
+    else:
+        image_data = payload.get("image")
+        if not image_data:
+            return jsonify({"error": "Missing 'image' field"}), 400
+
     try:
-        image = _decode_image(image_data)
+        if image_file is not None:
+            image = Image.open(BytesIO(image_data))
+            image.load()
+        else:
+            image = _decode_image(image_data)
         fast = build_fast_path(image)
         route = route_fast_path(fast)
     except Exception:
@@ -247,6 +268,8 @@ def v1_frame(session_id):
     try:
         result = scan_shelf_image(image, payload.get("query"))
     except Exception:
+        logger = __import__("logging").getLogger("shelf-scouter")
+        logger.exception("SHELF-SCOUTER inference failure")
         return jsonify({"error": "Inference failed"}), 500
     match = _match_requested_item(result, payload.get("query"), payload.get("barcode"))
     match = _enrich_candidate_from_adapter(session, match)

@@ -140,3 +140,28 @@ def test_valid_server_evidence_and_server_allow_reach_existing_execution_path(mo
     assert body["resource_route"]["decision"] == "ALLOW"
     assert body["execution"]["source"] == "shelf-scouter-execution"
     assert len(mobile_gateway._sessions[SESSION_ID]["picks"]) == 1
+
+def test_model_only_sku_match_cannot_create_trusted_identity():
+    """A model SKU match without trusted evidence must remain unverified."""
+    from mobile_gateway import _identity_from_frame
+    from product_verification import IdentityStatus
+
+    frame = {
+        "session_id": "security-test-session",
+        "frame_id": "security-test-frame",
+        "pick_match": {
+            "found": True,
+            "candidate": {
+                "sku": "SKU-1",
+                "name": "Model Suggested Product",
+            },
+        },
+        "physical_identity_verified": False,
+        "physical_identity_gtin": None,
+    }
+
+    identity = _identity_from_frame(frame, "SKU-1")
+
+    assert identity.status is not IdentityStatus.VERIFIED
+    assert identity.detected_sku is None
+    assert identity.confidence < 0.90

@@ -35,7 +35,11 @@ def test_expired_evidence_is_rejected():
     assert authority.verify(evidence, now=111) is False
 
 
-def test_unconfigured_authority_issues_no_evidence():
+def test_unconfigured_authority_issues_no_evidence(monkeypatch):
+    # This test must remain unconfigured even when the developer shell has
+    # HOARE_TRUSTED_EVIDENCE_SECRET set for real gateway testing.
+    monkeypatch.delenv("HOARE_TRUSTED_EVIDENCE_SECRET", raising=False)
+
     authority = TrustedEvidenceAuthority(None)
     adapter = CatalogOnlyAdapter([{"sku": "SKU-1", "gtin": "0001", "name": "Item"}])
     evidence = verify_against_adapter(
