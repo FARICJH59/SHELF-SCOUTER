@@ -31,12 +31,16 @@ IoT Camera / Mobile App
          │
          ▼
 ┌──────────────────────────────────────────────────┐
-│  Gemma 4 (google-generativeai SDK)               │
+│  Gemma 4 (Google GenAI SDK)                      │
 │  • Model: gemma-4-e4b-it  (configurable)         │
 │  • Vision encoder: ~150 M parameters             │
 │  • Function calling → structured product list    │
 └──────────────────────────────────────────────────┘
 ```
+
+The runtime uses Google's supported `google-genai` Python SDK. A small local
+compatibility facade preserves the existing SHELF-SCOUTER inference interface
+while routing requests through the current client-based SDK.
 
 ---
 
