@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "SHELF-SCOUTER Pick Assistant",
+    "slug": "shelf-scouter",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "android": {
+      "package": "com.techfusion.shelfscouter",
+      "permissions": ["CAMERA"]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow SHELF-SCOUTER to scan grocery products while you pick an order.",
+          "barcodeScannerEnabled": true
+        }
+      ]
+    ]
+  }
+}

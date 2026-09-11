@@ -35,7 +35,7 @@ logger = logging.getLogger("shelf-scouter")
 # Gemma 4 client setup
 # ---------------------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GEMMA_MODEL = os.getenv("GEMMA_MODEL", "gemma-4-e4b-it")
+GEMMA_MODEL = os.getenv("GEMMA_MODEL", "gemini-2.5-flash")
 
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)

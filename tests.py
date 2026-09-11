@@ -69,10 +69,17 @@ os.environ.setdefault("GOOGLE_API_KEY", "test-key")
 
 import app as shelf_app
 
+# Endpoint tests mock inference, so isolate them from the developer machine's
+# real Google API-key environment. Production app.py behavior is unchanged.
+shelf_app.GOOGLE_API_KEY = "test-key"
+
 
 def _make_b64_image() -> str:
-    """Return a minimal valid base64-encoded JPEG string."""
-    return base64.b64encode(b"FAKE").decode()
+    """Return a minimal valid PNG base64 string for endpoint tests."""
+    return (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "YAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+    )
 
 
 class TestHealthEndpoint(unittest.TestCase):
@@ -215,13 +222,13 @@ class TestSearchEndpoint(unittest.TestCase):
 
 class TestDecodeImage(unittest.TestCase):
     def test_plain_base64(self):
-        raw = base64.b64encode(b"TEST").decode()
+        raw = _make_b64_image()
         img = shelf_app._decode_image(raw)
         self.assertIsNotNone(img)
 
     def test_data_url(self):
-        raw = base64.b64encode(b"TEST").decode()
-        data_url = f"data:image/jpeg;base64,{raw}"
+        raw = _make_b64_image()
+        data_url = f"data:image/png;base64,{raw}"
         img = shelf_app._decode_image(data_url)
         self.assertIsNotNone(img)
 

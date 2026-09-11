@@ -1,0 +1,432 @@
+"""Phone-first gateway for SHELF-SCOUTER.
+
+The existing scan capability remains intact. The v1 picking surface adds an
+additive fast-path, trusted identity verification, HOARE admission, and
+execution feedback boundary before a pick can be confirmed.
+
+Security boundary:
+- Client requests may provide observations, but cannot self-authorize identity.
+- Product verification evidence is issued only by the server-side trusted
+  evidence authority after an authorized retailer adapter lookup.
+- Physical identity is derived from server-controlled image bytes, never from
+  a client barcode or model claim.
+- Resource-route decisions are accepted either from a trusted internal caller
+  or from the server-side HOARE route adapter; the phone never supplies an
+  authoritative route decision.
+- Missing or invalid trusted evidence/route escalates rather than assuming ALLOW.
+"""
+
+import os
+from dataclasses import asdict
+from datetime import datetime, timezone
+from io import BytesIO
+from uuid import uuid4
+
+from flask import jsonify, request
+from PIL import Image
+
+from app import app, scan_shelf_image, _decode_image, _sessions, GOOGLE_API_KEY
+from retailer_adapters import get_adapter
+from fast_path import build_fast_path, route_fast_path
+from product_verification import ProductEvidence, verify_product, identity_summary
+from hoare_pick_admission import AdmissionDecision, PickRequest, ResourceRoute, admit_pick
+from execution_feedback import ExecutionFeedbackRecorder
+from trusted_product_evidence import TrustedEvidenceAuthority, TrustedProductEvidence, verify_against_adapter
+from hoare_resource_route import server_resource_route
+from physical_identity_verifier import PyzbarBarcodeDecoder, ServerBarcodePhysicalIdentityVerifier
+
+_feedback = ExecutionFeedbackRecorder()
+_EVIDENCE_AUTHORITY = TrustedEvidenceAuthority()
+_INTERNAL_ROUTE_TOKEN = os.getenv("HOARE_INTERNAL_ROUTE_TOKEN")
+_PHYSICAL_IDENTITY_VERIFIER = ServerBarcodePhysicalIdentityVerifier(PyzbarBarcodeDecoder())
+
+
+def _session(session_id):
+    return _sessions.get(session_id)
+
+
+def _server_image_bytes(image) -> bytes:
+    """Serialize the server-decoded image losslessly for physical verification."""
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _authorized_gtin_for_sku(adapter, *, sku: str, store_id: str | None) -> str | None:
+    """Return GTIN only from an authorized adapter exact-SKU lookup."""
+    if not sku.strip():
+        return None
+    items = adapter.resolve_item(query=sku.strip(), store_id=store_id, barcode=None)
+    matches = [item for item in items if item.sku == sku.strip() and item.gtin]
+    if len(matches) != 1:
+        return None
+    return str(matches[0].gtin).strip() or None
+
+
+def _match_requested_item(result: dict, query: str | None, barcode: str | None = None) -> dict:
+    """Return a deterministic vision candidate; never treat it as verified identity."""
+    products = result.get("products", [])
+    q = (query or "").strip().lower()
+    candidates = []
+    for product in products:
+        name = str(product.get("name", ""))
+        label = str(product.get("label_text", ""))
+        haystack = f"{name} {label}".lower()
+        score = 0
+        if q and q in haystack:
+            score += 100
+        if barcode and barcode in haystack:
+            score += 200
+        if q:
+            score += sum(1 for token in q.split() if token in haystack) * 10
+        score += {"high": 5, "medium": 2}.get(str(product.get("confidence", "")).lower(), 0)
+        if score:
+            candidates.append((score, product))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if not candidates:
+        return {"found": False, "action": "KEEP_SCANNING", "candidate": None}
+    return {"found": True, "action": "VERIFY_AND_PICK", "candidate": candidates[0][1], "score": candidates[0][0]}
+
+
+def _enrich_candidate_from_adapter(session: dict, match: dict) -> dict:
+    """Attach canonical retailer identifiers without turning them into trust evidence."""
+    candidate = match.get("candidate")
+    if not isinstance(candidate, dict):
+        return match
+    if candidate.get("sku"):
+        return match
+    query = str(candidate.get("name") or candidate.get("label_text") or "").strip()
+    if not query:
+        return match
+    adapter = get_adapter(session.get("retailer"))
+    items = adapter.resolve_item(query=query, store_id=session.get("store_id"), barcode=None)
+    if len(items) != 1 or not items[0].sku:
+        return match
+    enriched = dict(candidate)
+    enriched["sku"] = items[0].sku
+    if items[0].gtin:
+        enriched["gtin"] = items[0].gtin
+    enriched["retailer_catalog_match"] = True
+    return {**match, "candidate": enriched}
+
+
+def _trusted_evidence_from_frame(frame: dict) -> TrustedProductEvidence | None:
+    raw = frame.get("trusted_evidence")
+    if not isinstance(raw, dict):
+        return None
+    required = {
+        "session_id", "frame_id", "requested_sku", "detected_sku", "barcode_match",
+        "catalog_match", "visual_match", "ocr_match", "issuer", "issued_at",
+        "expires_at", "signature",
+    }
+    if not required.issubset(raw):
+        return None
+    try:
+        evidence = TrustedProductEvidence(**{key: raw[key] for key in required})
+    except (TypeError, ValueError):
+        return None
+    if evidence.session_id != frame.get("session_id") or evidence.frame_id != frame.get("frame_id"):
+        return None
+    return evidence if _EVIDENCE_AUTHORITY.verify(evidence) else None
+
+
+def _identity_from_frame(frame: dict, requested_sku: str | None = None):
+    """Build identity only from server-issued trusted evidence."""
+    candidate = (frame.get("pick_match") or {}).get("candidate") or {}
+    evidence = _trusted_evidence_from_frame(frame)
+    if evidence is None or (requested_sku and evidence.requested_sku != requested_sku):
+        observed = []
+        if frame.get("barcode"):
+            observed.append(ProductEvidence("barcode_observation", str(frame["barcode"]), 1.0))
+        if candidate.get("name"):
+            observed.append(ProductEvidence("vision_name_observation", str(candidate["name"]), 0.70))
+        return verify_product(
+            requested_sku=requested_sku,
+            detected_sku=None,
+            name=candidate.get("name"),
+            evidence=observed,
+        )
+    trusted = ProductEvidence("trusted_retailer_evidence", evidence.signature, 1.0)
+    return verify_product(
+        requested_sku=evidence.requested_sku,
+        detected_sku=evidence.detected_sku,
+        name=candidate.get("name"),
+        barcode_match=evidence.barcode_match,
+        catalog_match=evidence.catalog_match,
+        visual_match=evidence.visual_match,
+        ocr_match=evidence.ocr_match,
+        evidence=[trusted],
+    )
+
+
+def _route_from_payload(payload: dict) -> ResourceRoute:
+    """Validate a route supplied by the trusted internal HOARE caller."""
+    route_payload = payload.get("resource_route") or {}
+    try:
+        decision = AdmissionDecision(str(route_payload.get("decision", "ESCALATE")))
+    except ValueError:
+        return ResourceRoute(decision=AdmissionDecision.DENY, reason=["invalid_resource_route_decision"])
+    reason = route_payload.get("reason", [])
+    if not isinstance(reason, list) or not all(isinstance(item, str) for item in reason):
+        return ResourceRoute(decision=AdmissionDecision.DENY, reason=["invalid_resource_route_reason"])
+    return ResourceRoute(
+        decision=decision,
+        provider=route_payload.get("provider"),
+        region=route_payload.get("region"),
+        predicted_latency_ms=route_payload.get("predicted_latency_ms"),
+        reason=reason,
+    )
+
+
+def _trusted_resource_route(payload: dict, *, allow_server_route: bool = False) -> ResourceRoute:
+    """Accept a route only from trusted internal HOARE or server-side authority."""
+    token = request.headers.get("X-HOARE-Internal-Route-Token")
+    if _INTERNAL_ROUTE_TOKEN and token == _INTERNAL_ROUTE_TOKEN:
+        return _route_from_payload(payload)
+    if allow_server_route:
+        return server_resource_route()
+    return ResourceRoute(decision=AdmissionDecision.ESCALATE, reason=["trusted_resource_authority_required"])
+
+
+@app.get("/v1/health")
+def v1_health():
+    return jsonify({
+        "status": "ok", "service": "shelf-scouter-mobile-gateway",
+        "ai_configured": bool(GOOGLE_API_KEY),
+        "trusted_evidence_configured": _EVIDENCE_AUTHORITY.configured,
+    })
+
+
+@app.post("/v1/sessions")
+def v1_create_session():
+    payload = request.get_json(silent=True) or {}
+    session_id = str(uuid4())
+    _sessions[session_id] = {
+        "session_id": session_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "device_id": payload.get("device_id"),
+        "retailer": payload.get("retailer"),
+        "store_id": payload.get("store_id"),
+        "order_id": payload.get("order_id"),
+        "tenant_id": payload.get("tenant_id", "default"),
+        "gps": payload.get("gps"),
+        "qgps": payload.get("qgps"),
+        "orientation": payload.get("orientation"),
+        "frames": [],
+        "picks": [],
+    }
+    return jsonify({"session_id": session_id, "status": "active"})
+
+
+@app.post("/v1/sessions/<session_id>/frames")
+def v1_frame(session_id):
+    session = _session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if not GOOGLE_API_KEY:
+        return jsonify({"error": "GOOGLE_API_KEY not configured"}), 503
+    # Accept both the original JSON/base64 request and phone-native
+    # multipart/form-data uploads. Image decoding remains server-side.
+    payload = request.get_json(silent=True) or {}
+
+    image_file = request.files.get("image")
+    if image_file is not None:
+        image_data = image_file.read()
+        if not image_data:
+            return jsonify({"error": "Empty 'image' upload"}), 400
+
+        # Preserve optional request metadata supplied as multipart fields.
+        for field in ("query", "barcode", "gps", "qgps", "orientation"):
+            value = request.form.get(field)
+            if value is not None:
+                payload[field] = value
+    else:
+        image_data = payload.get("image")
+        if not image_data:
+            return jsonify({"error": "Missing 'image' field"}), 400
+
+    try:
+        if image_file is not None:
+            image = Image.open(BytesIO(image_data))
+            image.load()
+        else:
+            image = _decode_image(image_data)
+        fast = build_fast_path(image)
+        route = route_fast_path(fast)
+    except Exception:
+        return jsonify({"error": "Invalid image data"}), 400
+    if route == "VISION_ESCALATION":
+        frame = {
+            "frame_id": str(uuid4()), "session_id": session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "query": payload.get("query"), "barcode": payload.get("barcode"),
+            "fast_path": {"route": route, "quality": fast.quality.__dict__, "image_sha256": fast.image_sha256, "normalized_size": fast.normalized_size},
+            "action": "RECAPTURE", "result": {"products": [], "total_unique_products": 0},
+        }
+        session["frames"].append(frame)
+        return jsonify(frame), 202
+    try:
+        result = scan_shelf_image(image, payload.get("query"))
+    except Exception:
+        logger = __import__("logging").getLogger("shelf-scouter")
+        logger.exception("SHELF-SCOUTER inference failure")
+        return jsonify({"error": "Inference failed"}), 500
+    match = _match_requested_item(result, payload.get("query"), payload.get("barcode"))
+    match = _enrich_candidate_from_adapter(session, match)
+
+    physical_identity_verified = False
+    physical_identity_gtin = None
+    candidate = match.get("candidate") or {}
+    candidate_sku = str(candidate.get("sku") or "").strip()
+    if candidate_sku:
+        adapter = get_adapter(session.get("retailer"))
+        expected_gtin = _authorized_gtin_for_sku(
+            adapter, sku=candidate_sku, store_id=session.get("store_id")
+        )
+        if expected_gtin:
+            physical_identity_verified = _PHYSICAL_IDENTITY_VERIFIER.verify(
+                image_bytes=_server_image_bytes(image),
+                requested_sku=candidate_sku,
+                expected_gtin=expected_gtin,
+            )
+            if physical_identity_verified:
+                physical_identity_gtin = expected_gtin
+
+    frame = {
+        "frame_id": str(uuid4()), "session_id": session_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "query": payload.get("query"), "barcode": payload.get("barcode"),
+        "gps": payload.get("gps"), "qgps": payload.get("qgps"),
+        "orientation": payload.get("orientation"),
+        "fast_path": {"route": route, "quality": fast.quality.__dict__, "image_sha256": fast.image_sha256, "normalized_size": fast.normalized_size},
+        "result": result, "pick_match": match,
+        "physical_identity_verified": physical_identity_verified,
+        "physical_identity_gtin": physical_identity_gtin,
+        "action": "VERIFY_IDENTITY" if match.get("found") else "KEEP_SCANNING",
+    }
+    session["frames"].append(frame)
+    return jsonify(frame)
+
+
+@app.post("/v1/sessions/<session_id>/resolve")
+def v1_resolve(session_id):
+    session = _session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    payload = request.get_json(silent=True) or {}
+    query = str(payload.get("query", "")).strip()
+    if not query:
+        return jsonify({"error": "Missing 'query'"}), 400
+    adapter = get_adapter(session.get("retailer"))
+    items = adapter.resolve_item(query=query, store_id=session.get("store_id"), barcode=payload.get("barcode"))
+    return jsonify({"retailer": session.get("retailer") or "catalog", "query": query, "authorized_adapter": adapter.name, "candidates": [item.__dict__ for item in items]})
+
+
+@app.post("/v1/sessions/<session_id>/verify")
+def v1_verify(session_id):
+    """Verify a frame against the server-side authorized retailer adapter."""
+    session = _session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    payload = request.get_json(silent=True) or {}
+    frame_id = payload.get("source_frame_id")
+    requested_sku = str(payload.get("sku") or "").strip()
+    if not frame_id or not requested_sku:
+        return jsonify({"error": "source_frame_id and sku are required"}), 400
+    frame = next((f for f in session["frames"] if f.get("frame_id") == frame_id), None)
+    if not frame:
+        return jsonify({"error": "Source frame not found"}), 404
+    adapter = get_adapter(session.get("retailer"))
+    candidate = (frame.get("pick_match") or {}).get("candidate") or {}
+    detected_sku = str(candidate.get("sku") or "").strip() or None
+    barcode = str(frame.get("barcode") or "").strip() or None
+    evidence = verify_against_adapter(
+        authority=_EVIDENCE_AUTHORITY,
+        adapter=adapter,
+        session_id=session_id,
+        frame_id=frame_id,
+        requested_sku=requested_sku,
+        detected_sku=detected_sku,
+        barcode=barcode,
+        store_id=session.get("store_id"),
+        physical_identity_verified=bool(frame.get("physical_identity_verified", False)),
+    )
+    if evidence is None:
+        return jsonify({
+            "status": "UNKNOWN", "verified": False,
+            "reason": "trusted_retailer_evidence_unavailable",
+            "authorized_adapter": adapter.name,
+        }), 409
+    frame["trusted_evidence"] = asdict(evidence)
+    return jsonify({
+        "status": "VERIFIED", "verified": True,
+        "evidence": {"issuer": evidence.issuer, "issued_at": evidence.issued_at, "expires_at": evidence.expires_at},
+        "authorized_adapter": adapter.name,
+    })
+
+
+@app.post("/v1/sessions/<session_id>/admission")
+def v1_admission(session_id):
+    """Evaluate a source frame through the additive HOARE pick-admission contract."""
+    session = _session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    payload = request.get_json(silent=True) or {}
+    frame_id = payload.get("source_frame_id")
+    requested_sku = str(payload.get("sku") or "").strip()
+    if not frame_id or not requested_sku:
+        return jsonify({"error": "source_frame_id and sku are required"}), 400
+    frame = next((f for f in session["frames"] if f.get("frame_id") == frame_id), None)
+    if not frame:
+        return jsonify({"error": "Source frame not found"}), 404
+    identity = _identity_from_frame(frame, requested_sku)
+    route = _trusted_resource_route(payload)
+    admission = admit_pick(PickRequest(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id") or payload.get("order_id", "unknown"), requested_sku=requested_sku, device_id=session.get("device_id") or "unknown", store_id=session.get("store_id"), aisle=payload.get("aisle"), shelf=payload.get("shelf")), identity, route)
+    return jsonify({"decision": admission.decision.value, "reasons": admission.reasons, "identity": identity_summary(identity), "resource_route": route.__dict__, "next_action": "CONFIRM_PICK" if admission.decision is AdmissionDecision.ALLOW else "RECAPTURE_OR_TARGETED_VERIFICATION" if admission.decision is AdmissionDecision.ESCALATE else "STOP"})
+
+
+@app.post("/v1/sessions/<session_id>/pick")
+def v1_pick(session_id):
+    session = _session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    payload = request.get_json(silent=True) or {}
+    product = payload.get("product")
+    requested_sku = str(payload.get("sku") or "").strip()
+    source_frame_id = payload.get("source_frame_id")
+    if not product or not requested_sku or not source_frame_id:
+        return jsonify({"error": "product, sku, and source_frame_id are required"}), 400
+    frame = next((f for f in session["frames"] if f.get("frame_id") == source_frame_id), None)
+    if not frame:
+        return jsonify({"error": "Source frame not found"}), 404
+    identity = _identity_from_frame(frame, requested_sku)
+    route = _trusted_resource_route(payload, allow_server_route=True)
+    admission = admit_pick(PickRequest(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, device_id=session.get("device_id") or "unknown", store_id=session.get("store_id"), aisle=payload.get("aisle"), shelf=payload.get("shelf")), identity, route)
+    if admission.decision is not AdmissionDecision.ALLOW:
+        code = 409 if admission.decision is AdmissionDecision.ESCALATE else 403
+        return jsonify({"status": admission.decision.value, "reasons": admission.reasons, "identity": identity_summary(identity), "resource_route": route.__dict__, "action": "RECAPTURE_OR_TARGETED_VERIFICATION" if admission.decision is AdmissionDecision.ESCALATE else "STOP"}), code
+    try:
+        quantity = int(payload.get("quantity", 1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "quantity must be an integer"}), 400
+    if quantity < 1:
+        return jsonify({"error": "quantity must be >= 1"}), 400
+    execution = _feedback.start(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, provider=route.provider or payload.get("provider", "edge"), region=route.region or payload.get("region", "edge-local"), device_id=session.get("device_id") or "unknown", model=(frame.get("result") or {}).get("model", "targeted-vision"))
+    completed = _feedback.complete(execution.execution_id, success=True, identity_status=identity.status.value, identity_confidence=identity.confidence)
+    pick = {"pick_id": str(uuid4()), "timestamp": datetime.now(timezone.utc).isoformat(), "product": product, "sku": requested_sku, "gtin": payload.get("gtin"), "quantity": quantity, "source_frame_id": source_frame_id, "status": "confirmed", "admission": {"decision": admission.decision.value, "reasons": admission.reasons}, "resource_route": route.__dict__, "execution": _feedback.telemetry_observation(completed.execution_id)}
+    session["picks"].append(pick)
+    return jsonify(pick)
+
+
+@app.get("/v1/sessions/<session_id>")
+def v1_session(session_id):
+    session = _session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify(session)
+
+
+if __name__ == "__main__":
+    host = os.getenv("FLASK_HOST", "0.0.0.0")
+    port = int(os.getenv("FLASK_PORT", "5000"))
+    app.run(host=host, port=port)
