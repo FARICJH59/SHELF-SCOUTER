@@ -53,7 +53,7 @@ def _authority_swap(monkeypatch):
 
 
 def test_forged_trusted_evidence_cannot_reach_execution(monkeypatch):
-    authority = _authority_swap(monkeypatch)
+    _authority_swap(monkeypatch)
     frame = mobile_gateway._sessions[SESSION_ID]["frames"][0]
     forged = dict(frame["trusted_evidence"])
     forged["detected_sku"] = "EVIL-SKU"
@@ -80,9 +80,7 @@ def test_forged_trusted_evidence_cannot_reach_execution(monkeypatch):
     assert response.status_code == 409
     assert response.get_json()["status"] == "ESCALATE"
     assert mobile_gateway._sessions[SESSION_ID]["picks"] == []
-    assert authority.verify(
-        type("Evidence", (), forged)()
-    ) is False
+    assert mobile_gateway._trusted_evidence_from_frame(frame) is None
 
 
 def test_client_allow_route_cannot_override_server_escalate(monkeypatch):
