@@ -39,6 +39,7 @@ _feedback = ExecutionFeedbackRecorder()
 _EVIDENCE_AUTHORITY = TrustedEvidenceAuthority()
 _INTERNAL_ROUTE_TOKEN = os.getenv("HOARE_INTERNAL_ROUTE_TOKEN")
 _PHYSICAL_IDENTITY_VERIFIER = ServerBarcodePhysicalIdentityVerifier(PyzbarBarcodeDecoder())
+_BARCODE_DECODER = PyzbarBarcodeDecoder()
 
 
 def _session(session_id):
@@ -220,28 +221,28 @@ def v1_create_session():
 
 @app.post("/v1/sessions/<session_id>/frames")
 def v1_frame(session_id):
+    """Process a frame through the barcode-first trusted fast path."""
     session = _session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
-    if not GOOGLE_API_KEY:
-        return jsonify({"error": "GOOGLE_API_KEY not configured"}), 503
-    # Accept both the original JSON/base64 request and phone-native
-    # multipart/form-data uploads. Image decoding remains server-side.
+
     payload = request.get_json(silent=True) or {}
 
     image_file = request.files.get("image")
+
     if image_file is not None:
         image_data = image_file.read()
+
         if not image_data:
             return jsonify({"error": "Empty 'image' upload"}), 400
 
-        # Preserve optional request metadata supplied as multipart fields.
         for field in ("query", "barcode", "gps", "qgps", "orientation"):
             value = request.form.get(field)
             if value is not None:
                 payload[field] = value
     else:
         image_data = payload.get("image")
+
         if not image_data:
             return jsonify({"error": "Missing 'image' field"}), 400
 
@@ -251,59 +252,293 @@ def v1_frame(session_id):
             image.load()
         else:
             image = _decode_image(image_data)
+
         fast = build_fast_path(image)
         route = route_fast_path(fast)
+        server_image_bytes = _server_image_bytes(image)
+
     except Exception:
         return jsonify({"error": "Invalid image data"}), 400
+
+    # ---------------------------------------------------------------
+    # SERVER-SIDE BARCODE FAST PATH
+    # ---------------------------------------------------------------
+    # Never trust payload["barcode"] as physical identity.
+    # Only a barcode decoded from server-controlled image bytes can
+    # enter this path.
+    # ---------------------------------------------------------------
+
+    server_barcodes = []
+
+    try:
+        decoded_values = _BARCODE_DECODER.decode(server_image_bytes)
+
+        if isinstance(decoded_values, list):
+            server_barcodes = [
+                value.strip()
+                for value in decoded_values
+                if isinstance(value, str) and value.strip()
+            ]
+
+    except Exception:
+        server_barcodes = []
+
+    adapter = get_adapter(session.get("retailer"))
+
+    authorized_matches = []
+
+    for observed_gtin in server_barcodes:
+        try:
+            items = adapter.resolve_gtin(
+                gtin=observed_gtin,
+                store_id=session.get("store_id"),
+            )
+        except Exception:
+            items = []
+
+        for item in items:
+            authorized_matches.append((observed_gtin, item))
+
+    # Remove duplicate SKU/GTIN results.
+    unique_matches = []
+    seen = set()
+
+    for observed_gtin, item in authorized_matches:
+        key = (
+            str(item.sku or "").strip(),
+            str(item.gtin or "").strip(),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_matches.append((observed_gtin, item))
+
+    # ---------------------------------------------------------------
+    # EXACT AUTHORIZED BARCODE MATCH
+    # ---------------------------------------------------------------
+
+    if len(unique_matches) == 1:
+        observed_gtin, item = unique_matches[0]
+
+        candidate = {
+            "name": item.name,
+            "sku": item.sku,
+            "gtin": item.gtin,
+            "retailer": item.retailer,
+            "available": item.available,
+            "quantity": item.quantity,
+            "metadata": item.metadata or {},
+            "confidence": "high",
+            "identity_source": "server_barcode_authorized_gtin",
+        }
+
+        result = {
+            "model": "server-barcode-fast-path",
+            "products": [candidate],
+            "total_unique_products": 1,
+            "summary": (
+                "Exact server-decoded barcode matched one authorized "
+                "retailer catalog item."
+            ),
+        }
+
+        match = {
+            "found": True,
+            "action": "VERIFY_AND_PICK",
+            "candidate": candidate,
+            "score": 300,
+            "match_source": "server_barcode_authorized_gtin",
+        }
+
+        frame = {
+            "frame_id": str(uuid4()),
+            "session_id": session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+
+            "query": payload.get("query"),
+
+            # Client barcode is observation only.
+            "barcode": payload.get("barcode"),
+
+            # Server-derived evidence.
+            "server_barcodes": server_barcodes,
+            "server_barcode_match": observed_gtin,
+
+            "gps": payload.get("gps"),
+            "qgps": payload.get("qgps"),
+            "orientation": payload.get("orientation"),
+
+            "fast_path": {
+                "route": "BARCODE_FAST",
+                "quality": fast.quality.__dict__,
+                "image_sha256": fast.image_sha256,
+                "normalized_size": fast.normalized_size,
+            },
+
+            "result": result,
+            "pick_match": match,
+
+            "physical_identity_verified": True,
+            "physical_identity_gtin": str(item.gtin).strip(),
+
+            "action": "VERIFY_IDENTITY",
+        }
+
+        session["frames"].append(frame)
+        return jsonify(frame)
+
+    # ---------------------------------------------------------------
+    # QUALITY ESCALATION
+    # ---------------------------------------------------------------
+
     if route == "VISION_ESCALATION":
         frame = {
-            "frame_id": str(uuid4()), "session_id": session_id,
+            "frame_id": str(uuid4()),
+            "session_id": session_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "query": payload.get("query"), "barcode": payload.get("barcode"),
-            "fast_path": {"route": route, "quality": fast.quality.__dict__, "image_sha256": fast.image_sha256, "normalized_size": fast.normalized_size},
-            "action": "RECAPTURE", "result": {"products": [], "total_unique_products": 0},
+            "query": payload.get("query"),
+            "barcode": payload.get("barcode"),
+            "server_barcodes": server_barcodes,
+
+            "fast_path": {
+                "route": route,
+                "quality": fast.quality.__dict__,
+                "image_sha256": fast.image_sha256,
+                "normalized_size": fast.normalized_size,
+            },
+
+            "action": "RECAPTURE",
+
+            "result": {
+                "products": [],
+                "total_unique_products": 0,
+            },
         }
+
         session["frames"].append(frame)
         return jsonify(frame), 202
+
+    # ---------------------------------------------------------------
+    # GEMINI FALLBACK
+    # ---------------------------------------------------------------
+
+    if not GOOGLE_API_KEY:
+        return jsonify({
+            "error": "GOOGLE_API_KEY not configured",
+            "barcode_fast_path": {
+                "attempted": True,
+                "server_barcodes": server_barcodes,
+                "authorized_match": False,
+            },
+        }), 503
+
     try:
-        result = scan_shelf_image(image, payload.get("query"))
-    except Exception:
+        result = scan_shelf_image(
+            image,
+            payload.get("query"),
+        )
+
+    except Exception as exc:
         logger = __import__("logging").getLogger("shelf-scouter")
         logger.exception("SHELF-SCOUTER inference failure")
-        return jsonify({"error": "Inference failed"}), 500
-    match = _match_requested_item(result, payload.get("query"), payload.get("barcode"))
-    match = _enrich_candidate_from_adapter(session, match)
+
+        error_text = str(exc)
+
+        if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text:
+            return jsonify({
+                "error": "AI_QUOTA_EXHAUSTED",
+                "message": "AI inference quota is exhausted.",
+                "barcode_fast_path": {
+                    "attempted": True,
+                    "server_barcodes": server_barcodes,
+                    "authorized_match": False,
+                },
+            }), 429
+
+        return jsonify({
+            "error": "Inference failed",
+            "barcode_fast_path": {
+                "attempted": True,
+                "server_barcodes": server_barcodes,
+                "authorized_match": False,
+            },
+        }), 500
+
+    match = _match_requested_item(
+        result,
+        payload.get("query"),
+        payload.get("barcode"),
+    )
+
+    match = _enrich_candidate_from_adapter(
+        session,
+        match,
+    )
 
     physical_identity_verified = False
     physical_identity_gtin = None
+
     candidate = match.get("candidate") or {}
     candidate_sku = str(candidate.get("sku") or "").strip()
+
     if candidate_sku:
-        adapter = get_adapter(session.get("retailer"))
         expected_gtin = _authorized_gtin_for_sku(
-            adapter, sku=candidate_sku, store_id=session.get("store_id")
+            adapter,
+            sku=candidate_sku,
+            store_id=session.get("store_id"),
         )
+
         if expected_gtin:
-            physical_identity_verified = _PHYSICAL_IDENTITY_VERIFIER.verify(
-                image_bytes=_server_image_bytes(image),
-                requested_sku=candidate_sku,
-                expected_gtin=expected_gtin,
+            physical_identity_verified = (
+                _PHYSICAL_IDENTITY_VERIFIER.verify(
+                    image_bytes=server_image_bytes,
+                    requested_sku=candidate_sku,
+                    expected_gtin=expected_gtin,
+                )
             )
+
             if physical_identity_verified:
                 physical_identity_gtin = expected_gtin
 
     frame = {
-        "frame_id": str(uuid4()), "session_id": session_id,
+        "frame_id": str(uuid4()),
+        "session_id": session_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "query": payload.get("query"), "barcode": payload.get("barcode"),
-        "gps": payload.get("gps"), "qgps": payload.get("qgps"),
+
+        "query": payload.get("query"),
+
+        # Client barcode remains observation only.
+        "barcode": payload.get("barcode"),
+
+        # Server-derived barcode observations.
+        "server_barcodes": server_barcodes,
+
+        "gps": payload.get("gps"),
+        "qgps": payload.get("qgps"),
         "orientation": payload.get("orientation"),
-        "fast_path": {"route": route, "quality": fast.quality.__dict__, "image_sha256": fast.image_sha256, "normalized_size": fast.normalized_size},
-        "result": result, "pick_match": match,
+
+        "fast_path": {
+            "route": "VISION_TARGETED",
+            "quality": fast.quality.__dict__,
+            "image_sha256": fast.image_sha256,
+            "normalized_size": fast.normalized_size,
+        },
+
+        "result": result,
+        "pick_match": match,
+
         "physical_identity_verified": physical_identity_verified,
         "physical_identity_gtin": physical_identity_gtin,
-        "action": "VERIFY_IDENTITY" if match.get("found") else "KEEP_SCANNING",
+
+        "action": (
+            "VERIFY_IDENTITY"
+            if match.get("found")
+            else "KEEP_SCANNING"
+        ),
     }
+
     session["frames"].append(frame)
     return jsonify(frame)
 
