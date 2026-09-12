@@ -34,8 +34,7 @@ def _controller():
             max_duration_seconds=30,
             max_recovery_depth=3,
             max_compute_budget=2.0,
-        ),
-        started_at=0.0,
+        )
     )
 
 
