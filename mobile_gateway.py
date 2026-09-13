@@ -31,7 +31,18 @@ from fast_path import build_fast_path, route_fast_path
 from product_verification import ProductEvidence, verify_product, identity_summary
 from hoare_pick_admission import AdmissionDecision, PickRequest, ResourceRoute, admit_pick
 from execution_feedback import ExecutionFeedbackRecorder
+from hoare_execution_plan import compile_execution_plan
+from hoare_execution_request import (
+    SHELF_SCOUTER_CONTRACT_VERSION,
+    VISION_CAPABILITY_VERSION,
+    authorize_execution,
+    compile_execution_request,
+    create_execution_receipt,
+    execution_signing_secret,
+)
+
 from trusted_product_evidence import TrustedEvidenceAuthority, TrustedProductEvidence, verify_against_adapter
+from hoare_diagnostic_barcode import GovernedBarcodeRecovery
 from hoare_resource_route import server_resource_route
 from physical_identity_verifier import PyzbarBarcodeDecoder, ServerBarcodePhysicalIdentityVerifier
 
@@ -39,6 +50,10 @@ _feedback = ExecutionFeedbackRecorder()
 _EVIDENCE_AUTHORITY = TrustedEvidenceAuthority()
 _INTERNAL_ROUTE_TOKEN = os.getenv("HOARE_INTERNAL_ROUTE_TOKEN")
 _PHYSICAL_IDENTITY_VERIFIER = ServerBarcodePhysicalIdentityVerifier(PyzbarBarcodeDecoder())
+_BARCODE_DECODER = PyzbarBarcodeDecoder()
+
+# GDA is diagnostic authority only. It never authorizes a pick.
+_GDA_BARCODE_RECOVERY = GovernedBarcodeRecovery()
 
 
 def _session(session_id):
@@ -220,28 +235,28 @@ def v1_create_session():
 
 @app.post("/v1/sessions/<session_id>/frames")
 def v1_frame(session_id):
+    """Process a frame through the barcode-first trusted fast path."""
     session = _session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
-    if not GOOGLE_API_KEY:
-        return jsonify({"error": "GOOGLE_API_KEY not configured"}), 503
-    # Accept both the original JSON/base64 request and phone-native
-    # multipart/form-data uploads. Image decoding remains server-side.
+
     payload = request.get_json(silent=True) or {}
 
     image_file = request.files.get("image")
+
     if image_file is not None:
         image_data = image_file.read()
+
         if not image_data:
             return jsonify({"error": "Empty 'image' upload"}), 400
 
-        # Preserve optional request metadata supplied as multipart fields.
         for field in ("query", "barcode", "gps", "qgps", "orientation"):
             value = request.form.get(field)
             if value is not None:
                 payload[field] = value
     else:
         image_data = payload.get("image")
+
         if not image_data:
             return jsonify({"error": "Missing 'image' field"}), 400
 
@@ -251,59 +266,492 @@ def v1_frame(session_id):
             image.load()
         else:
             image = _decode_image(image_data)
+
         fast = build_fast_path(image)
         route = route_fast_path(fast)
+        server_image_bytes = _server_image_bytes(image)
+
     except Exception:
         return jsonify({"error": "Invalid image data"}), 400
+
+    # ---------------------------------------------------------------
+    # SERVER-SIDE BARCODE FAST PATH
+    # ---------------------------------------------------------------
+    # Never trust payload["barcode"] as physical identity.
+    # Only a barcode decoded from server-controlled image bytes can
+    # enter this path.
+    # ---------------------------------------------------------------
+
+    server_barcodes = []
+
+    # Provenance for barcode observations.
+    # "direct" means the normal server-side decoder succeeded.
+    # "gda_recovery" means the governed diagnostic recovery path
+    # recovered additional barcode evidence from server-controlled
+    # image bytes. GDA never authorizes a pick.
+    server_barcode_source = None
+    gda_recovery = {
+        "attempted": False,
+        "route": None,
+        "diagnosis": None,
+        "attempts": 0,
+        "values": [],
+    }
+
+    try:
+        decoded_values = _BARCODE_DECODER.decode(server_image_bytes)
+
+        if isinstance(decoded_values, list):
+            server_barcodes = [
+                value.strip()
+                for value in decoded_values
+                if isinstance(value, str) and value.strip()
+            ]
+
+        if server_barcodes:
+            server_barcode_source = "direct"
+
+    except Exception:
+        server_barcodes = []
+
+    # ---------------------------------------------------------------
+    # GOVERNED DIAGNOSTIC BARCODE RECOVERY
+    # ---------------------------------------------------------------
+    # Only run GDA when the normal server-side barcode decoder found
+    # no usable barcode. GDA receives server-controlled image bytes.
+    #
+    # GDA is diagnostic authority only:
+    #   diagnostic recovery != physical identity verification
+    #   diagnostic recovery != action authorization
+    # ---------------------------------------------------------------
+
+    if not server_barcodes:
+        try:
+            gda_result = _GDA_BARCODE_RECOVERY.recover(
+                server_image_bytes,
+                session_id=session_id,
+                source_frame_id=fast.image_sha256,
+            )
+
+            recovered_values = [
+                str(value).strip()
+                for value in (gda_result.values or ())
+                if isinstance(value, str) and str(value).strip()
+            ]
+
+            gda_recovery = {
+                "attempted": True,
+                "route": gda_result.route,
+                "diagnosis": gda_result.diagnosis,
+                "attempts": gda_result.attempts,
+                "values": recovered_values,
+            }
+
+            if recovered_values:
+                server_barcodes = list(dict.fromkeys(recovered_values))
+                server_barcode_source = "gda_recovery"
+
+        except Exception:
+            # Diagnostic recovery failure must not break the normal
+            # vision fallback or authorize anything.
+            gda_recovery = {
+                "attempted": True,
+                "route": "GDA_ERROR",
+                "diagnosis": "GDA_RECOVERY_EXCEPTION",
+                "attempts": 0,
+                "values": [],
+            }
+
+    adapter = get_adapter(session.get("retailer"))
+
+    authorized_matches = []
+
+    for observed_gtin in server_barcodes:
+        try:
+            items = adapter.resolve_gtin(
+                gtin=observed_gtin,
+                store_id=session.get("store_id"),
+            )
+        except Exception:
+            items = []
+
+        for item in items:
+            authorized_matches.append((observed_gtin, item))
+
+    # Remove duplicate SKU/GTIN results.
+    unique_matches = []
+    seen = set()
+
+    for observed_gtin, item in authorized_matches:
+        key = (
+            str(item.sku or "").strip(),
+            str(item.gtin or "").strip(),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_matches.append((observed_gtin, item))
+
+    # ---------------------------------------------------------------
+    # EXACT AUTHORIZED BARCODE MATCH
+    # ---------------------------------------------------------------
+
+    if (
+        len(unique_matches) == 1
+        and server_barcode_source == "direct"
+    ):
+        observed_gtin, item = unique_matches[0]
+
+        candidate = {
+            "name": item.name,
+            "sku": item.sku,
+            "gtin": item.gtin,
+            "retailer": item.retailer,
+            "available": item.available,
+            "quantity": item.quantity,
+            "metadata": item.metadata or {},
+            "confidence": "high",
+            "identity_source": "server_barcode_authorized_gtin",
+        }
+
+        result = {
+            "model": "server-barcode-fast-path",
+            "products": [candidate],
+            "total_unique_products": 1,
+            "summary": (
+                "Exact server-decoded barcode matched one authorized "
+                "retailer catalog item."
+            ),
+        }
+
+        match = {
+            "found": True,
+            "action": "VERIFY_AND_PICK",
+            "candidate": candidate,
+            "score": 300,
+            "match_source": "server_barcode_authorized_gtin",
+        }
+
+        frame = {
+            "frame_id": str(uuid4()),
+            "session_id": session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+
+            "query": payload.get("query"),
+
+            # Client barcode is observation only.
+            "barcode": payload.get("barcode"),
+
+            # Server-derived evidence.
+            "server_barcodes": server_barcodes,
+            "server_barcode_source": server_barcode_source,
+            "gda_recovery": gda_recovery,
+            "server_barcode_match": observed_gtin,
+
+            "gps": payload.get("gps"),
+            "qgps": payload.get("qgps"),
+            "orientation": payload.get("orientation"),
+
+            "fast_path": {
+                "route": "BARCODE_FAST",
+                "quality": fast.quality.__dict__,
+                "image_sha256": fast.image_sha256,
+                "normalized_size": fast.normalized_size,
+            },
+
+            "result": result,
+            "pick_match": match,
+
+            "physical_identity_verified": True,
+            "physical_identity_gtin": str(item.gtin).strip(),
+
+            "action": "VERIFY_IDENTITY",
+        }
+
+        session["frames"].append(frame)
+        return jsonify(frame)
+
+    # ---------------------------------------------------------------
+    # GOVERNED GDA BARCODE RECOVERY
+    # ---------------------------------------------------------------
+    #
+    # GDA recovery is diagnostic evidence only.
+    #
+    # It does NOT inherit the trust of the direct server barcode path.
+    # A recovered GTIN must:
+    #
+    #   1. resolve through the authorized retailer adapter
+    #   2. map to exactly one catalog item
+    #   3. pass the independent physical-identity verifier
+    #
+    # Only then may physical_identity_verified become True.
+    #
+    # GDA itself never authorizes the pick.
+    # ---------------------------------------------------------------
+
+    if (
+        server_barcode_source == "gda_recovery"
+        and len(unique_matches) == 1
+    ):
+        recovered_gtin, recovered_item = unique_matches[0]
+
+        recovered_sku = str(recovered_item.sku or "").strip()
+
+        expected_gtin = None
+        recovered_identity_verified = False
+
+        if recovered_sku:
+            expected_gtin = _authorized_gtin_for_sku(
+                adapter,
+                sku=recovered_sku,
+                store_id=session.get("store_id"),
+            )
+
+        if expected_gtin:
+            recovered_identity_verified = (
+                _PHYSICAL_IDENTITY_VERIFIER.verify(
+                    image_bytes=server_image_bytes,
+                    requested_sku=recovered_sku,
+                    expected_gtin=expected_gtin,
+                )
+            )
+
+        if recovered_identity_verified:
+            candidate = {
+                "name": recovered_item.name,
+                "sku": recovered_item.sku,
+                "gtin": recovered_item.gtin,
+                "retailer": recovered_item.retailer,
+                "available": recovered_item.available,
+                "quantity": recovered_item.quantity,
+                "metadata": recovered_item.metadata or {},
+                "confidence": "high",
+                "identity_source": "gda_barcode_physical_verified",
+            }
+
+            result = {
+                "model": "hoare-gda-barcode-recovery",
+                "products": [candidate],
+                "total_unique_products": 1,
+                "summary": (
+                    "HOARE GDA recovered a server-side barcode, the "
+                    "retailer adapter authorized the GTIN, and the "
+                    "independent physical identity verifier confirmed "
+                    "the product."
+                ),
+            }
+
+            match = {
+                "found": True,
+                "action": "VERIFY_AND_PICK",
+                "candidate": candidate,
+                "score": 300,
+                "match_source": "gda_barcode_physical_verified",
+            }
+
+            frame = {
+                "frame_id": str(uuid4()),
+                "session_id": session_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+
+                "query": payload.get("query"),
+
+                # Client barcode remains observation only.
+                "barcode": payload.get("barcode"),
+
+                # Server/GDA evidence.
+                "server_barcodes": server_barcodes,
+                "server_barcode_source": server_barcode_source,
+                "gda_recovery": gda_recovery,
+                "server_barcode_match": recovered_gtin,
+
+                "gps": payload.get("gps"),
+                "qgps": payload.get("qgps"),
+                "orientation": payload.get("orientation"),
+
+                "fast_path": {
+                    "route": "GDA_BARCODE_RECOVERY",
+                    "quality": fast.quality.__dict__,
+                    "image_sha256": fast.image_sha256,
+                    "normalized_size": fast.normalized_size,
+                },
+
+                "gda": {
+                    "attempted": True,
+                    "route": gda_recovery.get("route"),
+                    "diagnosis": gda_recovery.get("diagnosis"),
+                    "attempts": gda_recovery.get("attempts", 0),
+                    "values": gda_recovery.get("values", []),
+                    "physical_identity_verified": True,
+                },
+
+                "result": result,
+                "pick_match": match,
+
+                "physical_identity_verified": True,
+                "physical_identity_gtin": str(expected_gtin).strip(),
+
+                "action": "VERIFY_IDENTITY",
+            }
+
+            session["frames"].append(frame)
+            return jsonify(frame)
+
+    # ---------------------------------------------------------------
+    # QUALITY ESCALATION
+    # ---------------------------------------------------------------
+
     if route == "VISION_ESCALATION":
         frame = {
-            "frame_id": str(uuid4()), "session_id": session_id,
+            "frame_id": str(uuid4()),
+            "session_id": session_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "query": payload.get("query"), "barcode": payload.get("barcode"),
-            "fast_path": {"route": route, "quality": fast.quality.__dict__, "image_sha256": fast.image_sha256, "normalized_size": fast.normalized_size},
-            "action": "RECAPTURE", "result": {"products": [], "total_unique_products": 0},
+            "query": payload.get("query"),
+            "barcode": payload.get("barcode"),
+            "server_barcodes": server_barcodes,
+
+            "fast_path": {
+                "route": route,
+                "quality": fast.quality.__dict__,
+                "image_sha256": fast.image_sha256,
+                "normalized_size": fast.normalized_size,
+            },
+
+            "action": "RECAPTURE",
+
+            "result": {
+                "products": [],
+                "total_unique_products": 0,
+            },
         }
+
         session["frames"].append(frame)
         return jsonify(frame), 202
+
+    # ---------------------------------------------------------------
+    # GEMINI FALLBACK
+    # ---------------------------------------------------------------
+
+    if not GOOGLE_API_KEY:
+        return jsonify({
+            "error": "GOOGLE_API_KEY not configured",
+            "barcode_fast_path": {
+                "attempted": True,
+                "server_barcodes": server_barcodes,
+                "authorized_match": False,
+            },
+        }), 503
+
     try:
-        result = scan_shelf_image(image, payload.get("query"))
-    except Exception:
-        logger = __import__("logging").getLogger("shelf-scouter")
-        logger.exception("SHELF-SCOUTER inference failure")
-        return jsonify({"error": "Inference failed"}), 500
-    match = _match_requested_item(result, payload.get("query"), payload.get("barcode"))
-    match = _enrich_candidate_from_adapter(session, match)
+        result = scan_shelf_image(
+            image,
+            payload.get("query"),
+        )
+
+    except Exception as exc:
+        import logging
+
+        logger = logging.getLogger("shelf-scouter")
+        logger.exception("SHELF_SCOUTER_INFERENCE_FAILURE")
+
+        status_code = getattr(exc, "status_code", None)
+
+        if status_code == 503:
+            return jsonify({
+                "error": "AI_PROVIDER_UNAVAILABLE",
+                "message": "The AI inference provider is temporarily unavailable.",
+                "retryable": True,
+            }), 503
+
+        if status_code == 429:
+            return jsonify({
+                "error": "AI_QUOTA_EXHAUSTED",
+                "message": "The AI inference provider quota is currently unavailable.",
+                "retryable": False,
+            }), 429
+
+        return jsonify({
+            "error": "Inference failed",
+            "retryable": False,
+        }), 500
+
+    match = _match_requested_item(
+        result,
+        payload.get("query"),
+        payload.get("barcode"),
+    )
+
+    match = _enrich_candidate_from_adapter(
+        session,
+        match,
+    )
 
     physical_identity_verified = False
     physical_identity_gtin = None
+
     candidate = match.get("candidate") or {}
     candidate_sku = str(candidate.get("sku") or "").strip()
+
     if candidate_sku:
-        adapter = get_adapter(session.get("retailer"))
         expected_gtin = _authorized_gtin_for_sku(
-            adapter, sku=candidate_sku, store_id=session.get("store_id")
+            adapter,
+            sku=candidate_sku,
+            store_id=session.get("store_id"),
         )
+
         if expected_gtin:
-            physical_identity_verified = _PHYSICAL_IDENTITY_VERIFIER.verify(
-                image_bytes=_server_image_bytes(image),
-                requested_sku=candidate_sku,
-                expected_gtin=expected_gtin,
+            physical_identity_verified = (
+                _PHYSICAL_IDENTITY_VERIFIER.verify(
+                    image_bytes=server_image_bytes,
+                    requested_sku=candidate_sku,
+                    expected_gtin=expected_gtin,
+                )
             )
+
             if physical_identity_verified:
                 physical_identity_gtin = expected_gtin
 
     frame = {
-        "frame_id": str(uuid4()), "session_id": session_id,
+        "frame_id": str(uuid4()),
+        "session_id": session_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "query": payload.get("query"), "barcode": payload.get("barcode"),
-        "gps": payload.get("gps"), "qgps": payload.get("qgps"),
+
+        "query": payload.get("query"),
+
+        # Client barcode remains observation only.
+        "barcode": payload.get("barcode"),
+
+        # Server-derived barcode observations.
+        "server_barcodes": server_barcodes,
+        "server_barcode_source": server_barcode_source,
+        "gda_recovery": gda_recovery,
+
+        "gps": payload.get("gps"),
+        "qgps": payload.get("qgps"),
         "orientation": payload.get("orientation"),
-        "fast_path": {"route": route, "quality": fast.quality.__dict__, "image_sha256": fast.image_sha256, "normalized_size": fast.normalized_size},
-        "result": result, "pick_match": match,
+
+        "fast_path": {
+            "route": "VISION_TARGETED",
+            "quality": fast.quality.__dict__,
+            "image_sha256": fast.image_sha256,
+            "normalized_size": fast.normalized_size,
+        },
+
+        "result": result,
+        "pick_match": match,
+
         "physical_identity_verified": physical_identity_verified,
         "physical_identity_gtin": physical_identity_gtin,
-        "action": "VERIFY_IDENTITY" if match.get("found") else "KEEP_SCANNING",
+
+        "action": (
+            "VERIFY_IDENTITY"
+            if match.get("found")
+            else "KEEP_SCANNING"
+        ),
     }
+
     session["frames"].append(frame)
     return jsonify(frame)
 
@@ -387,34 +835,203 @@ def v1_admission(session_id):
 
 @app.post("/v1/sessions/<session_id>/pick")
 def v1_pick(session_id):
+    """Execute a pick only after the complete HOARE execution boundary."""
     session = _session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+
     payload = request.get_json(silent=True) or {}
     product = payload.get("product")
     requested_sku = str(payload.get("sku") or "").strip()
     source_frame_id = payload.get("source_frame_id")
+
     if not product or not requested_sku or not source_frame_id:
-        return jsonify({"error": "product, sku, and source_frame_id are required"}), 400
-    frame = next((f for f in session["frames"] if f.get("frame_id") == source_frame_id), None)
+        return jsonify({
+            "error": "product, sku, and source_frame_id are required"
+        }), 400
+
+    frame = next(
+        (f for f in session["frames"] if f.get("frame_id") == source_frame_id),
+        None,
+    )
     if not frame:
         return jsonify({"error": "Source frame not found"}), 404
+
+    # Identity is derived exclusively from server-issued trusted evidence.
     identity = _identity_from_frame(frame, requested_sku)
+
+    # The phone cannot supply an authoritative route decision.
     route = _trusted_resource_route(payload, allow_server_route=True)
-    admission = admit_pick(PickRequest(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, device_id=session.get("device_id") or "unknown", store_id=session.get("store_id"), aisle=payload.get("aisle"), shelf=payload.get("shelf")), identity, route)
+
+    admission = admit_pick(
+        PickRequest(
+            tenant_id=session.get("tenant_id", "default"),
+            order_id=session.get("order_id", "unknown"),
+            requested_sku=requested_sku,
+            device_id=session.get("device_id") or "unknown",
+            store_id=session.get("store_id"),
+            aisle=payload.get("aisle"),
+            shelf=payload.get("shelf"),
+        ),
+        identity,
+        route,
+    )
+
     if admission.decision is not AdmissionDecision.ALLOW:
-        code = 409 if admission.decision is AdmissionDecision.ESCALATE else 403
-        return jsonify({"status": admission.decision.value, "reasons": admission.reasons, "identity": identity_summary(identity), "resource_route": route.__dict__, "action": "RECAPTURE_OR_TARGETED_VERIFICATION" if admission.decision is AdmissionDecision.ESCALATE else "STOP"}), code
+        code = (
+            409
+            if admission.decision is AdmissionDecision.ESCALATE
+            else 403
+        )
+        return jsonify({
+            "status": admission.decision.value,
+            "reasons": admission.reasons,
+            "identity": identity_summary(identity),
+            "resource_route": route.__dict__,
+            "action": (
+                "RECAPTURE_OR_TARGETED_VERIFICATION"
+                if admission.decision is AdmissionDecision.ESCALATE
+                else "STOP"
+            ),
+        }), code
+
     try:
         quantity = int(payload.get("quantity", 1))
     except (TypeError, ValueError):
         return jsonify({"error": "quantity must be an integer"}), 400
+
     if quantity < 1:
         return jsonify({"error": "quantity must be >= 1"}), 400
-    execution = _feedback.start(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, provider=route.provider or payload.get("provider", "edge"), region=route.region or payload.get("region", "edge-local"), device_id=session.get("device_id") or "unknown", model=(frame.get("result") or {}).get("model", "targeted-vision"))
-    completed = _feedback.complete(execution.execution_id, success=True, identity_status=identity.status.value, identity_confidence=identity.confidence)
-    pick = {"pick_id": str(uuid4()), "timestamp": datetime.now(timezone.utc).isoformat(), "product": product, "sku": requested_sku, "gtin": payload.get("gtin"), "quantity": quantity, "source_frame_id": source_frame_id, "status": "confirmed", "admission": {"decision": admission.decision.value, "reasons": admission.reasons}, "resource_route": route.__dict__, "execution": _feedback.telemetry_observation(completed.execution_id)}
+
+    # Execution requires server-verified evidence. Diagnostic recovery,
+    # client observations, and vision candidates cannot become authority.
+    trusted_evidence = _trusted_evidence_from_frame(frame)
+
+    if trusted_evidence is None:
+        return jsonify({
+            "status": "ESCALATE",
+            "reasons": ["trusted_evidence_required_for_execution"],
+            "identity": identity_summary(identity),
+            "resource_route": route.__dict__,
+            "action": "RECAPTURE_OR_TARGETED_VERIFICATION",
+        }), 409
+
+    signing_secret = execution_signing_secret()
+
+    if not signing_secret:
+        return jsonify({
+            "status": "EXECUTION_UNAVAILABLE",
+            "error": "HOARE_EXECUTION_SIGNING_KEY not configured",
+            "reasons": ["execution_signing_secret_required"],
+        }), 503
+
+    request_id = str(uuid4())
+
+    try:
+        # The execution plan is server-authoritative and is derived from
+        # the already-admitted request. Client plan data is never trusted.
+        execution_plan = compile_execution_plan(
+            admission=admission,
+            source_frame_id=source_frame_id,
+            evidence_signature=trusted_evidence.signature,
+            quantity=quantity,
+            capability_version=VISION_CAPABILITY_VERSION,
+            contract_version=SHELF_SCOUTER_CONTRACT_VERSION,
+        )
+
+        execution_request = compile_execution_request(
+            admission=admission,
+            request_id=request_id,
+            source_frame_id=source_frame_id,
+            evidence_signature=trusted_evidence.signature,
+            plan_hash=execution_plan.plan_hash,
+            secret=signing_secret,
+        )
+
+        authorization = authorize_execution(
+            execution_request,
+            secret=signing_secret,
+            expected_tenant_id=session.get("tenant_id", "default"),
+            expected_device_id=session.get("device_id") or "unknown",
+        )
+
+    except Exception as exc:
+        # Fail closed. Do not permit execution when the execution boundary
+        # cannot be constructed or independently authorized.
+        return jsonify({
+            "status": "EXECUTION_DENIED",
+            "error": str(exc),
+            "reasons": [str(exc)],
+        }), 403
+
+    if not authorization.allowed:
+        return jsonify({
+            "status": "EXECUTION_DENIED",
+            "error": "execution_request_authorization_failed",
+            "reasons": list(authorization.reasons),
+            "request_hash": execution_request.request_hash,
+        }), 403
+
+    # Existing execution recorder remains the actual execution path.
+    execution = _feedback.start(
+        tenant_id=session.get("tenant_id", "default"),
+        order_id=session.get("order_id", "unknown"),
+        requested_sku=requested_sku,
+        provider=route.provider or payload.get("provider", "edge"),
+        region=route.region or payload.get("region", "edge-local"),
+        device_id=session.get("device_id") or "unknown",
+        model=(frame.get("result") or {}).get(
+            "model",
+            "targeted-vision",
+        ),
+    )
+
+    completed = _feedback.complete(
+        execution.execution_id,
+        success=True,
+        identity_status=identity.status.value,
+        identity_confidence=identity.confidence,
+    )
+
+    execution_observation = _feedback.telemetry_observation(
+        completed.execution_id
+    )
+
+    # Make the execution ID explicit because the receipt binds to it.
+    execution_observation = {
+        **execution_observation,
+        "execution_id": completed.execution_id,
+    }
+
+    execution_receipt = create_execution_receipt(
+        request=execution_request,
+        execution_id=completed.execution_id,
+        status="SUCCEEDED",
+        result=execution_observation,
+        secret=signing_secret,
+    )
+
+    pick = {
+        "pick_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "product": product,
+        "sku": requested_sku,
+        "gtin": payload.get("gtin"),
+        "quantity": quantity,
+        "source_frame_id": source_frame_id,
+        "status": "confirmed",
+        "admission": {
+            "decision": admission.decision.value,
+            "reasons": admission.reasons,
+        },
+        "resource_route": route.__dict__,
+        "execution": execution_observation,
+        "execution_request": asdict(execution_request),
+        "execution_receipt": asdict(execution_receipt),
+    }
+
     session["picks"].append(pick)
+
     return jsonify(pick)
 
 
