@@ -81,6 +81,32 @@ The trace is intentionally outside the signed execution request payload. It expl
 
 The customer-facing `/pick` response is unchanged by this diagnostic enrichment. The trace exists only in the internal diagnostic/control-plane record.
 
+## Governed remediation proposal
+
+As of **2026-09-13**, diagnostic findings can be converted into a `RemediationProposal` by `hoare_remediation_proposal.py`.
+
+A proposal is an **immutable, non-executable handoff** containing:
+
+- proposal ID and schema/version
+- originating session/execution identity
+- diagnostic disposition
+- one action explicitly present in the diagnostic findings
+- diagnostic evidence references
+- execution-boundary provenance
+- canonical proposal hash
+- `authority=proposal-only`
+- `can_execute=false`
+
+The compiler rejects:
+
+- healthy reports
+- reports without findings
+- actions that were not proposed by the diagnostic findings
+
+This is intentional: the debugging agent cannot invent an executable fix merely because a caller asks for one.
+
+The proposal is not an execution request. It is the artifact that must be returned to HOARE/AEGIS for a new admission decision. Only a newly admitted action can enter the signed execution-request path.
+
 ## Safety rules
 
 1. Client observations are never promoted to authority by diagnosis.
@@ -89,8 +115,10 @@ The customer-facing `/pick` response is unchanged by this diagnostic enrichment.
 4. Proposed actions are recommendations only.
 5. Post-execution diagnosis cannot alter the already-completed execution result.
 6. Diagnostic provenance is not execution authority and is not added to the signed request payload.
-7. Any future remediation executor must enter the existing HOARE execution boundary and signed-request authorization path.
-8. The debugger must remain independently testable and provider-neutral so it can later support other HOARE verticals.
+7. A remediation proposal is not an authorization and cannot execute itself.
+8. Proposal actions must originate in the diagnostic findings; callers cannot inject arbitrary actions.
+9. Any future remediation executor must enter the existing HOARE/AEGIS admission and signed-request authorization path.
+10. The debugger must remain independently testable and provider-neutral so it can later support other HOARE verticals.
 
 ## Relationship to SHELF-SCOUTER
 
