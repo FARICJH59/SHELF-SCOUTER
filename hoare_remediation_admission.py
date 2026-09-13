@@ -73,14 +73,34 @@ class RemediationAdmissionCandidate:
     session_id: str
     execution_id: str | None
     action: str
-    request: PickRequest
+    tenant_id: str
+    order_id: str
+    requested_sku: str
+    device_id: str
+    store_id: str | None
+    aisle: str | None
+    shelf: str | None
     evidence_refs: tuple[str, ...]
     execution_boundary: Mapping[str, Any]
     candidate_hash: str
     authority: str = "admission-required"
     can_execute: bool = False
 
+    def request(self) -> PickRequest:
+        """Materialize a fresh request only when entering the existing gate."""
+        return PickRequest(
+            tenant_id=self.tenant_id,
+            order_id=self.order_id,
+            requested_sku=self.requested_sku,
+            device_id=self.device_id,
+            store_id=self.store_id,
+            aisle=self.aisle,
+            shelf=self.shelf,
+            intent=f"hoare_remediation:{self.action}",
+        )
+
     def unsigned_payload(self) -> dict[str, Any]:
+        request = self.request()
         return {
             "schema": self.schema,
             "adapter_version": self.adapter_version,
@@ -90,14 +110,14 @@ class RemediationAdmissionCandidate:
             "execution_id": self.execution_id,
             "action": self.action,
             "request": {
-                "tenant_id": self.request.tenant_id,
-                "order_id": self.request.order_id,
-                "requested_sku": self.request.requested_sku,
-                "device_id": self.request.device_id,
-                "store_id": self.request.store_id,
-                "aisle": self.request.aisle,
-                "shelf": self.request.shelf,
-                "intent": self.request.intent,
+                "tenant_id": request.tenant_id,
+                "order_id": request.order_id,
+                "requested_sku": request.requested_sku,
+                "device_id": request.device_id,
+                "store_id": request.store_id,
+                "aisle": request.aisle,
+                "shelf": request.shelf,
+                "intent": request.intent,
             },
             "evidence_refs": list(self.evidence_refs),
             "execution_boundary": dict(self.execution_boundary),
@@ -137,19 +157,6 @@ def compile_remediation_admission_candidate(
     if not request.requested_sku:
         raise RemediationAdmissionError("admission_request_sku_required")
 
-    # A remediation candidate gets a fresh admission intent. It does not copy
-    # the original execution intent and it cannot inherit prior authorization.
-    bound_request = PickRequest(
-        tenant_id=request.tenant_id,
-        order_id=request.order_id,
-        requested_sku=request.requested_sku,
-        device_id=request.device_id,
-        store_id=request.store_id,
-        aisle=request.aisle,
-        shelf=request.shelf,
-        intent=f"hoare_remediation:{proposal.action}",
-    )
-
     unsigned = {
         "schema": SCHEMA_VERSION,
         "adapter_version": ADAPTER_VERSION,
@@ -159,14 +166,14 @@ def compile_remediation_admission_candidate(
         "execution_id": proposal.execution_id,
         "action": proposal.action,
         "request": {
-            "tenant_id": bound_request.tenant_id,
-            "order_id": bound_request.order_id,
-            "requested_sku": bound_request.requested_sku,
-            "device_id": bound_request.device_id,
-            "store_id": bound_request.store_id,
-            "aisle": bound_request.aisle,
-            "shelf": bound_request.shelf,
-            "intent": bound_request.intent,
+            "tenant_id": request.tenant_id,
+            "order_id": request.order_id,
+            "requested_sku": request.requested_sku,
+            "device_id": request.device_id,
+            "store_id": request.store_id,
+            "aisle": request.aisle,
+            "shelf": request.shelf,
+            "intent": f"hoare_remediation:{proposal.action}",
         },
         "evidence_refs": list(proposal.evidence_refs),
         "execution_boundary": dict(proposal.execution_boundary),
@@ -175,8 +182,20 @@ def compile_remediation_admission_candidate(
     }
 
     return RemediationAdmissionCandidate(
-        **unsigned,
-        request=bound_request,
+        schema=SCHEMA_VERSION,
+        adapter_version=ADAPTER_VERSION,
+        proposal_id=proposal.proposal_id,
+        proposal_hash=proposal.proposal_hash,
+        session_id=proposal.session_id,
+        execution_id=proposal.execution_id,
+        action=proposal.action,
+        tenant_id=request.tenant_id,
+        order_id=request.order_id,
+        requested_sku=request.requested_sku,
+        device_id=request.device_id,
+        store_id=request.store_id,
+        aisle=request.aisle,
+        shelf=request.shelf,
         evidence_refs=tuple(unsigned["evidence_refs"]),
         execution_boundary=dict(proposal.execution_boundary),
         candidate_hash=_sha256(unsigned),
@@ -204,7 +223,7 @@ def admit_remediation_candidate(
         raise RemediationAdmissionError("candidate_must_not_be_executable")
 
     return admit_pick(
-        candidate.request,
+        candidate.request(),
         identity,
         resource_route=resource_route,
     )
