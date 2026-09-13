@@ -3,8 +3,6 @@
 Provenance: 2026-09-13.
 """
 
-from dataclasses import asdict
-
 from execution_feedback import ExecutionFeedbackRecorder
 from hoare_debugging_agent import DiagnosticDisposition
 from hoare_execution_plan import compile_execution_plan
