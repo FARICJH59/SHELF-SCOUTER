@@ -369,6 +369,9 @@ def create_execution_receipt(
         # Diagnostic enrichment is best-effort telemetry. It must never turn a
         # valid signed receipt into an execution failure.
         pass
+    finally:
+        # The report now owns the trace; do not retain an unbounded global copy.
+        _EXECUTION_TRACE.pop(request.request_hash, None)
 
     return receipt
 
