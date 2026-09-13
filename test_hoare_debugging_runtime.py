@@ -3,14 +3,17 @@
 Provenance: 2026-09-13.
 """
 
-from __future__ import annotations
-
 import pytest
 
 from execution_feedback import ExecutionFeedbackRecorder
 from hoare_debugging_agent import DiagnosticDisposition
 from hoare_debugging_runtime import HoareDebuggingRuntime
-from hoare_pick_admission import PickRequest
+from hoare_pick_admission import AdmissionDecision, PickRequest, ResourceRoute
+from hoare_remediation_coordinator import RemediationCoordinatorError
+from product_verification import verify_product
+
+
+SECRET = "runtime-test-remediation-key"
 
 
 @pytest.fixture
@@ -36,6 +39,14 @@ def _request() -> PickRequest:
         order_id="order-1",
         requested_sku="SKU-123",
         device_id="device-1",
+    )
+
+
+def _route(decision=AdmissionDecision.ALLOW) -> ResourceRoute:
+    return ResourceRoute(
+        decision=decision,
+        provider="test-provider",
+        region="test-region",
     )
 
 
@@ -146,3 +157,100 @@ def test_runtime_can_build_non_executable_remediation_candidate(
     assert candidate.proposal_id == "proposal-runtime-1"
     assert candidate.execution_id == record.execution_id
     assert candidate.request().intent == "hoare_remediation:revalidate_inputs"
+
+
+def test_runtime_prepares_fresh_governed_remediation_without_execution(
+    recorder: ExecutionFeedbackRecorder,
+) -> None:
+    record = _start(recorder)
+    recorder.complete(
+        record.execution_id,
+        success=False,
+        identity_status="UNVERIFIED",
+        error="identity mismatch",
+    )
+
+    runtime = HoareDebuggingRuntime()
+    report = runtime.diagnose_execution(
+        recorder,
+        execution_id=record.execution_id,
+        session_id="session-remediation",
+        trusted_evidence=True,
+        execution_authorized=True,
+        evidence_refs=("evidence:remediation",),
+    )
+    candidate = runtime.propose_remediation_candidate(
+        report,
+        proposal_id="proposal-runtime-2",
+        action="revalidate_inputs",
+        request=_request(),
+    )
+
+    identity = verify_product(requested_sku="SKU-123", detected_sku="SKU-123")
+    preparation = runtime.prepare_remediation_execution(
+        candidate=candidate,
+        identity=identity,
+        source_frame_id="frame-remediation",
+        evidence_signature="evidence-signature",
+        capability_version="1.0.0",
+        contract_version="1.0.0",
+        request_id="runtime-remediation-request-1",
+        secret=SECRET,
+        resource_route=_route(),
+        now=1000.0,
+    )
+
+    assert preparation.admission.decision is AdmissionDecision.ALLOW
+    assert preparation.execution.allowed is True
+    assert preparation.execution.request.request_id == "runtime-remediation-request-1"
+    assert preparation.execution.request.plan_hash == preparation.execution.plan.plan_hash
+    assert preparation.execution.binding.proposal_id == candidate.proposal_id
+    assert preparation.execution.binding.original_execution_id == record.execution_id
+    assert preparation.execution.binding.authority == "signed-execution-required"
+    assert preparation.execution.binding.can_execute is False
+
+
+def test_runtime_remediation_reenters_admission_and_stops_on_deny(
+    recorder: ExecutionFeedbackRecorder,
+) -> None:
+    record = _start(recorder)
+    recorder.complete(
+        record.execution_id,
+        success=False,
+        identity_status="UNVERIFIED",
+        error="identity mismatch",
+    )
+
+    runtime = HoareDebuggingRuntime()
+    report = runtime.diagnose_execution(
+        recorder,
+        execution_id=record.execution_id,
+        session_id="session-remediation-deny",
+        trusted_evidence=True,
+        execution_authorized=True,
+    )
+    candidate = runtime.propose_remediation_candidate(
+        report,
+        proposal_id="proposal-runtime-3",
+        action="revalidate_inputs",
+        request=_request(),
+    )
+
+    identity = verify_product(requested_sku="SKU-123", detected_sku="SKU-123")
+
+    with pytest.raises(
+        RemediationCoordinatorError,
+        match="remediation_execution_requires_fresh_allow_admission",
+    ):
+        runtime.prepare_remediation_execution(
+            candidate=candidate,
+            identity=identity,
+            source_frame_id="frame-remediation-deny",
+            evidence_signature="evidence-signature",
+            capability_version="1.0.0",
+            contract_version="1.0.0",
+            request_id="runtime-remediation-request-2",
+            secret=SECRET,
+            resource_route=_route(AdmissionDecision.DENY),
+            now=1000.0,
+        )
