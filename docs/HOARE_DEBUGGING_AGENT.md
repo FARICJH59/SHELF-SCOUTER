@@ -107,6 +107,48 @@ This is intentional: the debugging agent cannot invent an executable fix merely 
 
 The proposal is not an execution request. It is the artifact that must be returned to HOARE/AEGIS for a new admission decision. Only a newly admitted action can enter the signed execution-request path.
 
+## Proposal → admission adapter
+
+As of **2026-09-13**, `hoare_remediation_admission.py` provides the next control-plane handoff:
+
+```text
+Diagnostic finding
+      ↓
+RemediationProposal
+      ↓
+RemediationAdmissionCandidate
+      ↓
+HOARE / AEGIS admission
+      ↓
+ExecutionPlan
+      ↓
+SignedExecutionRequest
+      ↓
+Authorization
+      ↓
+Existing Executor
+```
+
+`RemediationAdmissionCandidate` is an immutable, non-executable envelope that binds:
+
+- the proposal ID and proposal hash
+- session/execution identity
+- the proposed action
+- a fresh `PickRequest` with a new remediation intent
+- diagnostic evidence references
+- the original execution-boundary provenance
+- a candidate hash
+- `authority=admission-required`
+- `can_execute=false`
+
+The adapter first recomputes the proposal hash. It rejects invalid proposal authority, executable proposals, missing request identity, and remediation actions that are not supported by this admission adapter.
+
+The adapter then delegates to the **existing** `admit_pick()` authority. It does not manufacture an `ALLOW`, create an authorization, call the executor, or bypass the signed execution-request boundary.
+
+This means a remediation proposal has to earn a new admission decision. Prior execution authorization is never inherited.
+
+The current adapter deliberately supports only the bounded actions `inspect_execution_telemetry` and `revalidate_inputs`. Adding another remediation action requires explicitly adding it to an admission adapter rather than silently broadening authority.
+
 ## Safety rules
 
 1. Client observations are never promoted to authority by diagnosis.
@@ -117,9 +159,11 @@ The proposal is not an execution request. It is the artifact that must be return
 6. Diagnostic provenance is not execution authority and is not added to the signed request payload.
 7. A remediation proposal is not an authorization and cannot execute itself.
 8. Proposal actions must originate in the diagnostic findings; callers cannot inject arbitrary actions.
-9. Any future remediation executor must enter the existing HOARE/AEGIS admission and signed-request authorization path.
-10. The debugger must remain independently testable and provider-neutral so it can later support other HOARE verticals.
+9. A remediation admission candidate cannot self-authorize; it must pass through the existing admission authority.
+10. A new admission does not inherit prior execution authorization.
+11. Any newly admitted remediation must enter the existing execution-plan and signed-request authorization path.
+12. The debugger and adapter must remain independently testable and provider-neutral so they can later support other HOARE verticals.
 
 ## Relationship to SHELF-SCOUTER
 
-The debugger can inspect the existing server-side pick workflow, including trusted evidence, admission, execution telemetry, signed execution requests, authorization, and receipts. It does not replace or modify the existing executor.
+The debugger and remediation adapter can inspect and re-enter the existing server-side pick workflow, including trusted evidence, admission, execution telemetry, signed execution requests, authorization, and receipts. They do not replace or modify the existing executor.
