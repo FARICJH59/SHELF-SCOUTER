@@ -133,7 +133,7 @@ def test_candidate_cannot_self_authorize():
         detected_sku="sku-1",
     )
 
-    with pytest.raises(RemediationAdmissionError, match="candidate_must_not_be_executable"):
+    with pytest.raises(RemediationAdmissionError, match="candidate_hash_invalid"):
         admit_remediation_candidate(
             candidate=tampered,
             identity=identity,
