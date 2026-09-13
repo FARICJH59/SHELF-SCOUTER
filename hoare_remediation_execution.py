@@ -84,11 +84,8 @@ class RemediationExecutionAuthorization:
         return self.authorization.allowed
 
 
-
 def _admission_hash(admission: PickAdmission) -> str:
-    # compile_execution_request already records an admission trace hash. This
-    # helper intentionally derives the same canonical input independently so
-    # the remediation binding can preserve the fresh admission provenance.
+    """Derive the canonical hash of the fresh admission for provenance."""
     import hashlib
     import json
 
@@ -191,15 +188,15 @@ def prepare_remediation_execution(
     )
 
     # Attach remediation provenance to the existing control-plane execution
-    # trace. This is diagnostic provenance, not signed-request authority.
-    from hoare_execution_request import attach_execution_provenance
+    # trace. This is diagnostic provenance, not signed-request authority. The
+    # trace is consumed by the existing receipt path and is not part of the
+    # signed request payload.
+    import hoare_execution_request as execution_boundary
 
-    attach_execution_provenance(
-        request.request_hash,
-        {
-            "remediation": binding.to_dict(),
-        },
-    )
+    trace = execution_boundary._EXECUTION_TRACE.get(request.request_hash)
+    if trace is None:
+        raise RemediationExecutionError("execution_trace_missing")
+    trace["remediation"] = binding.to_dict()
 
     authorization = authorize_execution(
         request,
