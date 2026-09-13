@@ -72,7 +72,7 @@ class ExecutionFeedbackRecorder:
         # Diagnostic-only post-completion hook. The existing execution path is
         # already complete at this point; diagnosis cannot change its result.
         self._diagnostic_reports[execution_id] = self._debugger.diagnose(
-            session_id=record.tenant_id,
+            session_id="execution-feedback",
             execution_id=execution_id,
             observations={
                 "tenant_id": record.tenant_id,
