@@ -14,15 +14,20 @@ from typing import Any, Mapping
 
 from execution_feedback import ExecutionFeedbackRecorder, PickExecution
 from hoare_debugging_agent import DebuggingReport, HoareDebuggingAgent
-from hoare_pick_admission import PickRequest
+from hoare_pick_admission import PickRequest, ResourceRoute
 from hoare_remediation_admission import (
     RemediationAdmissionCandidate,
     compile_remediation_admission_candidate,
+)
+from hoare_remediation_coordinator import (
+    RemediationExecutionPreparation,
+    coordinate_remediation,
 )
 from hoare_remediation_proposal import (
     RemediationProposal,
     compile_remediation_proposal,
 )
+from product_verification import ProductIdentity
 
 
 class HoareDebuggingRuntime:
@@ -89,6 +94,45 @@ class HoareDebuggingRuntime:
         return compile_remediation_admission_candidate(
             proposal=proposal,
             request=request,
+        )
+
+    def prepare_remediation_execution(
+        self,
+        *,
+        candidate: RemediationAdmissionCandidate,
+        identity: ProductIdentity,
+        source_frame_id: str,
+        evidence_signature: str,
+        capability_version: str,
+        contract_version: str,
+        request_id: str,
+        secret: str,
+        resource_route: ResourceRoute | None = None,
+        quantity: int = 1,
+        now: float | None = None,
+        ttl_seconds: float = 30.0,
+    ) -> RemediationExecutionPreparation:
+        """Prepare a governed remediation without executing it.
+
+        The coordinator re-enters the existing HOARE/AEGIS admission path,
+        creates a fresh execution plan, creates a fresh signed request, and
+        independently authorizes that request. The runtime deliberately stops
+        at preparation: the existing executor remains the sole execution
+        authority.
+        """
+        return coordinate_remediation(
+            candidate=candidate,
+            identity=identity,
+            source_frame_id=source_frame_id,
+            evidence_signature=evidence_signature,
+            capability_version=capability_version,
+            contract_version=contract_version,
+            request_id=request_id,
+            secret=secret,
+            resource_route=resource_route,
+            quantity=quantity,
+            now=now,
+            ttl_seconds=ttl_seconds,
         )
 
 
