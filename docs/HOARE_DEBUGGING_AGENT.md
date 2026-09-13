@@ -180,7 +180,7 @@ Signed Receipt
 5. independently authorizes that new request against tenant/device identity and expiry;
 6. binds proposal ID/hash, candidate hash, original execution ID, original execution-boundary provenance, and the fresh admission hash to the internal execution trace.
 
-The orchestration does **not** call the executor. The existing executor remains the sole execution mechanism. A caller that receives an allowed `RemediationExecutionAuthorization` may pass its signed request through the same executor path already used by `/pick`, then create the normal signed receipt. This avoids creating a parallel remediation executor.
+The orchestration does **not** call the executor. The existing executor remains the sole execution mechanism. After the existing executor completes, `finalize_remediation_receipt()` can create the normal signed `ExecutionReceipt` for the fresh request. This keeps receipt creation inside the existing signed boundary without creating a parallel executor.
 
 A prior execution's authorization is never inherited. Even if the original execution was authorized, remediation must earn a new admission, plan, signed request, and authorization.
 
