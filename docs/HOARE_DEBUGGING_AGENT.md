@@ -63,6 +63,24 @@ These reports are not added to the customer-facing pick response.
 
 The diagnostic hook does not authorize, execute, retry, or mutate the signed execution boundary. Any future remediation must return through HOARE/AEGIS admission and the signed execution-request path.
 
+## Execution evidence enrichment
+
+As of **2026-09-13**, the diagnostic report can be enriched after receipt creation with a control-plane-only `execution_boundary` trace. The trace is published by the existing signed execution boundary and attached to the already-created diagnostic report.
+
+The trace records provenance for:
+
+- trusted-evidence signature
+- admission decision and a canonical admission hash
+- server-authoritative execution-plan hash
+- signed execution request ID and request hash
+- independent authorization result, reasons, and authorization timestamp
+- execution ID
+- signed execution receipt hash and signature
+
+The trace is intentionally outside the signed execution request payload. It explains **why and how** an execution reached the executor without changing the authority model or the signed request itself.
+
+The customer-facing `/pick` response is unchanged by this diagnostic enrichment. The trace exists only in the internal diagnostic/control-plane record.
+
 ## Safety rules
 
 1. Client observations are never promoted to authority by diagnosis.
@@ -70,9 +88,10 @@ The diagnostic hook does not authorize, execute, retry, or mutate the signed exe
 3. Missing execution authorization is a critical condition.
 4. Proposed actions are recommendations only.
 5. Post-execution diagnosis cannot alter the already-completed execution result.
-6. Any future remediation executor must enter the existing HOARE execution boundary and signed-request authorization path.
-7. The debugger must remain independently testable and provider-neutral so it can later support other HOARE verticals.
+6. Diagnostic provenance is not execution authority and is not added to the signed request payload.
+7. Any future remediation executor must enter the existing HOARE execution boundary and signed-request authorization path.
+8. The debugger must remain independently testable and provider-neutral so it can later support other HOARE verticals.
 
 ## Relationship to SHELF-SCOUTER
 
-The debugger can inspect the existing server-side pick workflow, including trusted evidence, admission, execution telemetry, signed execution requests, and receipts. It does not replace or modify the existing executor.
+The debugger can inspect the existing server-side pick workflow, including trusted evidence, admission, execution telemetry, signed execution requests, authorization, and receipts. It does not replace or modify the existing executor.
