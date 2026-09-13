@@ -110,9 +110,12 @@ def compile_remediation_proposal(
         for ref in finding.evidence_refs
         if ref
     )
+    normalized_refs = tuple(dict.fromkeys(refs))
+
     boundary = report.metadata.get("execution_boundary", {})
     if not isinstance(boundary, Mapping):
         boundary = {}
+    normalized_boundary = dict(boundary)
 
     unsigned = {
         "schema": SCHEMA_VERSION,
@@ -122,18 +125,26 @@ def compile_remediation_proposal(
         "execution_id": report.execution_id,
         "disposition": report.disposition.value,
         "action": action,
-        "evidence_refs": list(dict.fromkeys(refs)),
-        "execution_boundary": dict(boundary),
+        "evidence_refs": list(normalized_refs),
+        "execution_boundary": normalized_boundary,
         "authority": "proposal-only",
         "can_execute": False,
     }
     proposal_hash = _sha256(unsigned)
 
     return RemediationProposal(
-        **unsigned,
-        evidence_refs=tuple(unsigned["evidence_refs"]),
-        execution_boundary=dict(boundary),
+        schema=SCHEMA_VERSION,
+        proposer_version=PROPOSER_VERSION,
+        proposal_id=proposal_id,
+        session_id=report.session_id,
+        execution_id=report.execution_id,
+        disposition=report.disposition.value,
+        action=action,
+        evidence_refs=normalized_refs,
+        execution_boundary=normalized_boundary,
         proposal_hash=proposal_hash,
+        authority="proposal-only",
+        can_execute=False,
     )
 
 
