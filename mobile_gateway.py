@@ -32,6 +32,7 @@ from product_verification import ProductEvidence, verify_product, identity_summa
 from hoare_pick_admission import AdmissionDecision, PickRequest, ResourceRoute, admit_pick
 from execution_feedback import ExecutionFeedbackRecorder
 from trusted_product_evidence import TrustedEvidenceAuthority, TrustedProductEvidence, verify_against_adapter
+from hoare_diagnostic_barcode import GovernedBarcodeRecovery
 from hoare_resource_route import server_resource_route
 from physical_identity_verifier import PyzbarBarcodeDecoder, ServerBarcodePhysicalIdentityVerifier
 
@@ -40,6 +41,9 @@ _EVIDENCE_AUTHORITY = TrustedEvidenceAuthority()
 _INTERNAL_ROUTE_TOKEN = os.getenv("HOARE_INTERNAL_ROUTE_TOKEN")
 _PHYSICAL_IDENTITY_VERIFIER = ServerBarcodePhysicalIdentityVerifier(PyzbarBarcodeDecoder())
 _BARCODE_DECODER = PyzbarBarcodeDecoder()
+
+# GDA is diagnostic authority only. It never authorizes a pick.
+_GDA_BARCODE_RECOVERY = GovernedBarcodeRecovery()
 
 
 def _session(session_id):
@@ -270,6 +274,20 @@ def v1_frame(session_id):
 
     server_barcodes = []
 
+    # Provenance for barcode observations.
+    # "direct" means the normal server-side decoder succeeded.
+    # "gda_recovery" means the governed diagnostic recovery path
+    # recovered additional barcode evidence from server-controlled
+    # image bytes. GDA never authorizes a pick.
+    server_barcode_source = None
+    gda_recovery = {
+        "attempted": False,
+        "route": None,
+        "diagnosis": None,
+        "attempts": 0,
+        "values": [],
+    }
+
     try:
         decoded_values = _BARCODE_DECODER.decode(server_image_bytes)
 
@@ -280,8 +298,59 @@ def v1_frame(session_id):
                 if isinstance(value, str) and value.strip()
             ]
 
+        if server_barcodes:
+            server_barcode_source = "direct"
+
     except Exception:
         server_barcodes = []
+
+    # ---------------------------------------------------------------
+    # GOVERNED DIAGNOSTIC BARCODE RECOVERY
+    # ---------------------------------------------------------------
+    # Only run GDA when the normal server-side barcode decoder found
+    # no usable barcode. GDA receives server-controlled image bytes.
+    #
+    # GDA is diagnostic authority only:
+    #   diagnostic recovery != physical identity verification
+    #   diagnostic recovery != action authorization
+    # ---------------------------------------------------------------
+
+    if not server_barcodes:
+        try:
+            gda_result = _GDA_BARCODE_RECOVERY.recover(
+                server_image_bytes,
+                session_id=session_id,
+                source_frame_id=fast.image_sha256,
+            )
+
+            recovered_values = [
+                str(value).strip()
+                for value in (gda_result.values or ())
+                if isinstance(value, str) and str(value).strip()
+            ]
+
+            gda_recovery = {
+                "attempted": True,
+                "route": gda_result.route,
+                "diagnosis": gda_result.diagnosis,
+                "attempts": gda_result.attempts,
+                "values": recovered_values,
+            }
+
+            if recovered_values:
+                server_barcodes = list(dict.fromkeys(recovered_values))
+                server_barcode_source = "gda_recovery"
+
+        except Exception:
+            # Diagnostic recovery failure must not break the normal
+            # vision fallback or authorize anything.
+            gda_recovery = {
+                "attempted": True,
+                "route": "GDA_ERROR",
+                "diagnosis": "GDA_RECOVERY_EXCEPTION",
+                "attempts": 0,
+                "values": [],
+            }
 
     adapter = get_adapter(session.get("retailer"))
 
@@ -319,7 +388,10 @@ def v1_frame(session_id):
     # EXACT AUTHORIZED BARCODE MATCH
     # ---------------------------------------------------------------
 
-    if len(unique_matches) == 1:
+    if (
+        len(unique_matches) == 1
+        and server_barcode_source == "direct"
+    ):
         observed_gtin, item = unique_matches[0]
 
         candidate = {
@@ -364,6 +436,8 @@ def v1_frame(session_id):
 
             # Server-derived evidence.
             "server_barcodes": server_barcodes,
+            "server_barcode_source": server_barcode_source,
+            "gda_recovery": gda_recovery,
             "server_barcode_match": observed_gtin,
 
             "gps": payload.get("gps"),
@@ -388,6 +462,132 @@ def v1_frame(session_id):
 
         session["frames"].append(frame)
         return jsonify(frame)
+
+    # ---------------------------------------------------------------
+    # GOVERNED GDA BARCODE RECOVERY
+    # ---------------------------------------------------------------
+    #
+    # GDA recovery is diagnostic evidence only.
+    #
+    # It does NOT inherit the trust of the direct server barcode path.
+    # A recovered GTIN must:
+    #
+    #   1. resolve through the authorized retailer adapter
+    #   2. map to exactly one catalog item
+    #   3. pass the independent physical-identity verifier
+    #
+    # Only then may physical_identity_verified become True.
+    #
+    # GDA itself never authorizes the pick.
+    # ---------------------------------------------------------------
+
+    if (
+        server_barcode_source == "gda_recovery"
+        and len(unique_matches) == 1
+    ):
+        recovered_gtin, recovered_item = unique_matches[0]
+
+        recovered_sku = str(recovered_item.sku or "").strip()
+
+        expected_gtin = None
+        recovered_identity_verified = False
+
+        if recovered_sku:
+            expected_gtin = _authorized_gtin_for_sku(
+                adapter,
+                sku=recovered_sku,
+                store_id=session.get("store_id"),
+            )
+
+        if expected_gtin:
+            recovered_identity_verified = (
+                _PHYSICAL_IDENTITY_VERIFIER.verify(
+                    image_bytes=server_image_bytes,
+                    requested_sku=recovered_sku,
+                    expected_gtin=expected_gtin,
+                )
+            )
+
+        if recovered_identity_verified:
+            candidate = {
+                "name": recovered_item.name,
+                "sku": recovered_item.sku,
+                "gtin": recovered_item.gtin,
+                "retailer": recovered_item.retailer,
+                "available": recovered_item.available,
+                "quantity": recovered_item.quantity,
+                "metadata": recovered_item.metadata or {},
+                "confidence": "high",
+                "identity_source": "gda_barcode_physical_verified",
+            }
+
+            result = {
+                "model": "hoare-gda-barcode-recovery",
+                "products": [candidate],
+                "total_unique_products": 1,
+                "summary": (
+                    "HOARE GDA recovered a server-side barcode, the "
+                    "retailer adapter authorized the GTIN, and the "
+                    "independent physical identity verifier confirmed "
+                    "the product."
+                ),
+            }
+
+            match = {
+                "found": True,
+                "action": "VERIFY_AND_PICK",
+                "candidate": candidate,
+                "score": 300,
+                "match_source": "gda_barcode_physical_verified",
+            }
+
+            frame = {
+                "frame_id": str(uuid4()),
+                "session_id": session_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+
+                "query": payload.get("query"),
+
+                # Client barcode remains observation only.
+                "barcode": payload.get("barcode"),
+
+                # Server/GDA evidence.
+                "server_barcodes": server_barcodes,
+                "server_barcode_source": server_barcode_source,
+                "gda_recovery": gda_recovery,
+                "server_barcode_match": recovered_gtin,
+
+                "gps": payload.get("gps"),
+                "qgps": payload.get("qgps"),
+                "orientation": payload.get("orientation"),
+
+                "fast_path": {
+                    "route": "GDA_BARCODE_RECOVERY",
+                    "quality": fast.quality.__dict__,
+                    "image_sha256": fast.image_sha256,
+                    "normalized_size": fast.normalized_size,
+                },
+
+                "gda": {
+                    "attempted": True,
+                    "route": gda_recovery.get("route"),
+                    "diagnosis": gda_recovery.get("diagnosis"),
+                    "attempts": gda_recovery.get("attempts", 0),
+                    "values": gda_recovery.get("values", []),
+                    "physical_identity_verified": True,
+                },
+
+                "result": result,
+                "pick_match": match,
+
+                "physical_identity_verified": True,
+                "physical_identity_gtin": str(expected_gtin).strip(),
+
+                "action": "VERIFY_IDENTITY",
+            }
+
+            session["frames"].append(frame)
+            return jsonify(frame)
 
     # ---------------------------------------------------------------
     # QUALITY ESCALATION
@@ -441,29 +641,30 @@ def v1_frame(session_id):
         )
 
     except Exception as exc:
-        logger = __import__("logging").getLogger("shelf-scouter")
-        logger.exception("SHELF-SCOUTER inference failure")
+        import logging
 
-        error_text = str(exc)
+        logger = logging.getLogger("shelf-scouter")
+        logger.exception("SHELF_SCOUTER_INFERENCE_FAILURE")
 
-        if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text:
+        status_code = getattr(exc, "status_code", None)
+
+        if status_code == 503:
+            return jsonify({
+                "error": "AI_PROVIDER_UNAVAILABLE",
+                "message": "The AI inference provider is temporarily unavailable.",
+                "retryable": True,
+            }), 503
+
+        if status_code == 429:
             return jsonify({
                 "error": "AI_QUOTA_EXHAUSTED",
-                "message": "AI inference quota is exhausted.",
-                "barcode_fast_path": {
-                    "attempted": True,
-                    "server_barcodes": server_barcodes,
-                    "authorized_match": False,
-                },
+                "message": "The AI inference provider quota is currently unavailable.",
+                "retryable": False,
             }), 429
 
         return jsonify({
             "error": "Inference failed",
-            "barcode_fast_path": {
-                "attempted": True,
-                "server_barcodes": server_barcodes,
-                "authorized_match": False,
-            },
+            "retryable": False,
         }), 500
 
     match = _match_requested_item(
@@ -514,6 +715,8 @@ def v1_frame(session_id):
 
         # Server-derived barcode observations.
         "server_barcodes": server_barcodes,
+        "server_barcode_source": server_barcode_source,
+        "gda_recovery": gda_recovery,
 
         "gps": payload.get("gps"),
         "qgps": payload.get("qgps"),

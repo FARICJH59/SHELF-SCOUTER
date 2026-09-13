@@ -1,22 +1,37 @@
-"""Governed barcode recovery for SHELF-SCOUTER.
+"""Governed server-side barcode recovery for SHELF-SCOUTER.
 
-Design/provenance record: 2026-09-12.
+GDA recovery is diagnostic authority only.
 
-This module performs bounded, server-side barcode recovery after the direct
-barcode probe fails. It never authorizes a pick and never treats a decoded
-barcode as trusted identity until the caller performs the existing retailer
-adapter authorization and physical-evidence checks.
+A recovered barcode MUST still pass:
+
+    server-side evidence
+        -> retailer adapter authorization
+        -> trusted evidence
+        -> HOARE admission
+
+This module never authorizes a pick.
+
+The recovery implementation is deliberately resource-bounded:
+- server-controlled image bytes only
+- bounded image dimensions
+- bounded preprocessing variants
+- bounded attempts
+- hard wall-clock diagnostic budget
+- no full-resolution upscaling
+- no authorization decision
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from io import BytesIO
+import time
 
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 from hoare_diagnostic_authority import (
     DiagnosticAction,
+    DiagnosticDecision,
     DiagnosticLease,
     DiagnosticLeaseController,
     DiagnosticObservation,
@@ -36,94 +51,238 @@ class BarcodeRecoveryResult:
 
 
 class GovernedBarcodeRecovery:
-    """Bounded preprocessing + server-side barcode recovery."""
+    """Bounded server-side barcode recovery.
+
+    Recovery is deliberately conservative:
+
+    - server-controlled image bytes only
+    - bounded image dimensions
+    - bounded number of attempts
+    - bounded wall-clock diagnostic budget
+    - bounded preprocessing
+    - no authorization decision
+
+    Diagnostic success is never authorization.
+    """
+
+    MAX_IMAGE_DIMENSION = 1280
+    MAX_DIAGNOSTIC_SECONDS = 5.0
+    MAX_VARIANTS = 3
+    JPEG_QUALITY = 82
 
     def __init__(self, decoder=None):
         self.decoder = decoder or PyzbarBarcodeDecoder()
+
         self.lease = DiagnosticLease(
             lease_id="shelf-scouter-barcode-recovery",
-            allowed_actions=frozenset({
-                DiagnosticAction.IMAGE_RESIZE,
-                DiagnosticAction.IMAGE_ENHANCE,
-                DiagnosticAction.IMAGE_ROTATE,
-                DiagnosticAction.BARCODE_SCAN,
-            }),
-            max_attempts=3,
-            max_duration_seconds=15.0,
+            allowed_actions=frozenset(
+                {
+                    DiagnosticAction.IMAGE_RESIZE,
+                    DiagnosticAction.IMAGE_ENHANCE,
+                    DiagnosticAction.IMAGE_ROTATE,
+                    DiagnosticAction.BARCODE_SCAN,
+                }
+            ),
+            max_attempts=self.MAX_VARIANTS,
+            max_duration_seconds=self.MAX_DIAGNOSTIC_SECONDS,
             max_recovery_depth=3,
             max_compute_budget=1.5,
         )
 
-    def recover(self, image_bytes: bytes) -> BarcodeRecoveryResult:
+    def recover(
+        self,
+        image_bytes: bytes,
+        *,
+        session_id: str = "barcode-recovery",
+        source_frame_id: str = "server-image",
+    ) -> BarcodeRecoveryResult:
+
         if not image_bytes:
-            return BarcodeRecoveryResult((), 0, "EMPTY_IMAGE", "ESCALATE")
+            return BarcodeRecoveryResult(
+                values=(),
+                attempts=0,
+                diagnosis="EMPTY_IMAGE",
+                route=DiagnosticDecision.ESCALATE.value,
+            )
 
         try:
             image = Image.open(BytesIO(image_bytes)).convert("RGB")
             image.load()
         except Exception:
-            return BarcodeRecoveryResult((), 0, "INVALID_IMAGE", "ESCALATE")
+            return BarcodeRecoveryResult(
+                values=(),
+                attempts=0,
+                diagnosis="INVALID_IMAGE",
+                route=DiagnosticDecision.ESCALATE.value,
+            )
 
         observation = DiagnosticObservation(
-            session_id="barcode-recovery",
-            source_frame_id="server-image",
+            session_id=session_id,
+            source_frame_id=source_frame_id,
             failure_code="BARCODE_NOT_FOUND",
             confidence=0.95,
-            facts={"rationale": "direct server barcode probe returned no identity"},
+            facts={
+                "rationale": (
+                    "direct server barcode probe "
+                    "returned no identity"
+                )
+            },
         )
+
         diagnosis = diagnose(observation)
+
         plan = build_recovery_plan(
             diagnosis,
             [
-                RecoveryStep(DiagnosticAction.IMAGE_RESIZE, {"scale": 2}),
-                RecoveryStep(DiagnosticAction.IMAGE_ENHANCE),
-                RecoveryStep(DiagnosticAction.IMAGE_ROTATE, {"angles": [90, 180, 270]}),
-                RecoveryStep(DiagnosticAction.BARCODE_SCAN),
+                RecoveryStep(
+                    DiagnosticAction.IMAGE_RESIZE,
+                    {"max_dimension": self.MAX_IMAGE_DIMENSION},
+                ),
+                RecoveryStep(
+                    DiagnosticAction.IMAGE_ENHANCE,
+                ),
+                RecoveryStep(
+                    DiagnosticAction.IMAGE_ROTATE,
+                    {"angles": [90]},
+                ),
+                RecoveryStep(
+                    DiagnosticAction.BARCODE_SCAN,
+                ),
             ],
-            rationale="recover physical barcode evidence using bounded server preprocessing",
+            rationale=(
+                "recover physical barcode evidence "
+                "using bounded server preprocessing"
+            ),
         )
 
         controller = DiagnosticLeaseController(self.lease)
-        admission = controller.admit(plan, compute_cost=1.0)
-        if admission.decision.value != "ALLOW":
-            return BarcodeRecoveryResult((), 0, diagnosis.failure_code, admission.decision.value)
+
+        admission = controller.admit(
+            plan,
+            compute_cost=1.0,
+        )
+
+        if admission.decision != DiagnosticDecision.ALLOW:
+            return BarcodeRecoveryResult(
+                values=(),
+                attempts=0,
+                diagnosis=diagnosis.failure_code,
+                route=admission.decision.value,
+            )
+
+        started = time.perf_counter()
+
+        # Never upscale a phone image for diagnostic recovery.
+        # Downscale only when the source exceeds the hard diagnostic
+        # dimension budget.
+        bounded = image.copy()
+        bounded.thumbnail(
+            (
+                self.MAX_IMAGE_DIMENSION,
+                self.MAX_IMAGE_DIMENSION,
+            ),
+            Image.Resampling.LANCZOS,
+        )
+
+        contrast = ImageEnhance.Contrast(
+            bounded
+        ).enhance(1.35)
+
+        sharp = ImageEnhance.Sharpness(
+            contrast
+        ).enhance(1.5)
 
         variants = [
-            image,
-            ImageOps.autocontrast(image),
-            ImageEnhance.Contrast(image).enhance(1.8),
-            ImageEnhance.Sharpness(ImageEnhance.Contrast(image).enhance(1.6)).enhance(2.0),
-            image.resize((image.width * 2, image.height * 2)),
+            bounded,
+            ImageOps.autocontrast(bounded),
+            sharp,
         ]
-
-        rotated = image.resize((image.width * 2, image.height * 2))
-        variants.extend(rotated.rotate(angle, expand=True) for angle in (90, 180, 270))
 
         values: list[str] = []
         seen: set[str] = set()
         attempts = 0
 
-        for variant in variants:
+        for variant in variants[: self.MAX_VARIANTS]:
+            # Hard wall-clock budget. This is checked before every
+            # diagnostic attempt so GDA cannot silently consume an
+            # unbounded amount of tenant/device compute.
+            if (
+                time.perf_counter() - started
+                >= self.MAX_DIAGNOSTIC_SECONDS
+            ):
+                return BarcodeRecoveryResult(
+                    values=tuple(values),
+                    attempts=attempts,
+                    diagnosis="GDA_COMPUTE_BUDGET_EXHAUSTED",
+                    route=DiagnosticDecision.ESCALATE.value,
+                )
+
             if attempts >= self.lease.max_attempts:
                 break
+
             attempts += 1
             buffer = BytesIO()
-            variant.save(buffer, format="PNG")
+
             try:
-                decoded = self.decoder.decode(buffer.getvalue())
+                # JPEG is deliberately used for bounded diagnostic
+                # transport/encoding. The original implementation
+                # generated expensive full PNG variants.
+                variant.save(
+                    buffer,
+                    format="JPEG",
+                    quality=self.JPEG_QUALITY,
+                    optimize=False,
+                )
+
+                decoded = self.decoder.decode(
+                    buffer.getvalue()
+                )
+
             except Exception:
                 decoded = []
-            for value in decoded if isinstance(decoded, list) else []:
-                if isinstance(value, str) and value.strip() and value.strip() not in seen:
-                    clean = value.strip()
-                    seen.add(clean)
-                    values.append(clean)
+
+            if not isinstance(decoded, list):
+                continue
+
+            for value in decoded:
+                if not isinstance(value, str):
+                    continue
+
+                clean = value.strip()
+
+                if not clean or clean in seen:
+                    continue
+
+                seen.add(clean)
+                values.append(clean)
 
             if values:
                 return BarcodeRecoveryResult(
-                    tuple(values), attempts, diagnosis.failure_code, "BARCODE_RECOVERED"
+                    values=tuple(values),
+                    attempts=attempts,
+                    diagnosis=diagnosis.failure_code,
+                    route="BARCODE_RECOVERED",
                 )
 
+        elapsed = time.perf_counter() - started
+
+        if elapsed >= self.MAX_DIAGNOSTIC_SECONDS:
+            return BarcodeRecoveryResult(
+                values=tuple(values),
+                attempts=attempts,
+                diagnosis="GDA_COMPUTE_BUDGET_EXHAUSTED",
+                route=DiagnosticDecision.ESCALATE.value,
+            )
+
         return BarcodeRecoveryResult(
-            tuple(values), attempts, diagnosis.failure_code, "ESCALATE"
+            values=tuple(values),
+            attempts=attempts,
+            diagnosis=diagnosis.failure_code,
+            route=DiagnosticDecision.ESCALATE.value,
         )
+
+
+__all__ = [
+    "BarcodeRecoveryResult",
+    "GovernedBarcodeRecovery",
+]
