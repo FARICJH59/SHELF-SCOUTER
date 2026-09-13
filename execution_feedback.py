@@ -1,4 +1,7 @@
-"""Execution feedback recorder for the SHELF-SCOUTER control loop."""
+"""Execution feedback recorder for the SHELF-SCOUTER control loop.
+
+Provenance: 2026-09-13.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,6 +9,8 @@ from datetime import datetime, timezone
 from math import ceil
 from time import perf_counter
 from uuid import uuid4
+
+from hoare_debugging_agent import DebuggingReport, HoareDebuggingAgent
 
 
 @dataclass
@@ -28,9 +33,17 @@ class PickExecution:
 
 
 class ExecutionFeedbackRecorder:
-    def __init__(self) -> None:
+    """Record execution telemetry and persist diagnostic observations.
+
+    The recorder remains telemetry/diagnostic infrastructure. It does not
+    authorize, execute, retry, or mutate the execution boundary.
+    """
+
+    def __init__(self, debugger: HoareDebuggingAgent | None = None) -> None:
         self._records: dict[str, PickExecution] = {}
         self._clocks: dict[str, float] = {}
+        self._diagnostic_reports: dict[str, DebuggingReport] = {}
+        self._debugger = debugger or HoareDebuggingAgent()
 
     def start(self, *, tenant_id: str, order_id: str, requested_sku: str,
               provider: str, region: str, device_id: str, model: str) -> PickExecution:
@@ -55,10 +68,45 @@ class ExecutionFeedbackRecorder:
         record.identity_status = identity_status
         record.identity_confidence = identity_confidence
         record.error = error
+
+        # Diagnostic-only post-completion hook. The existing execution path is
+        # already complete at this point; diagnosis cannot change its result.
+        self._diagnostic_reports[execution_id] = self._debugger.diagnose(
+            session_id=record.tenant_id,
+            execution_id=execution_id,
+            observations={
+                "tenant_id": record.tenant_id,
+                "order_id": record.order_id,
+                "requested_sku": record.requested_sku,
+                "provider": record.provider,
+                "region": record.region,
+                "device_id": record.device_id,
+                "model": record.model,
+                "identity_status": record.identity_status,
+                "identity_confidence": record.identity_confidence,
+                "evidence_refs": (f"execution:{execution_id}",),
+                "telemetry": self.telemetry_observation(execution_id),
+            },
+            execution_result={
+                "status": "SUCCEEDED" if success else "FAILED",
+                "latency_ms": record.latency_ms,
+                "error": record.error,
+                "identity_status": record.identity_status,
+                "identity_confidence": record.identity_confidence,
+            },
+        )
         return record
 
     def get(self, execution_id: str) -> PickExecution | None:
         return self._records.get(execution_id)
+
+    def diagnostic_report(self, execution_id: str) -> DebuggingReport | None:
+        """Return the internal diagnostic report for control-plane telemetry."""
+        return self._diagnostic_reports.get(execution_id)
+
+    def diagnostic_snapshot(self) -> list[DebuggingReport]:
+        """Return diagnostic reports without exposing them through pick APIs."""
+        return list(self._diagnostic_reports.values())
 
     def snapshot(self) -> list[PickExecution]:
         return list(self._records.values())
