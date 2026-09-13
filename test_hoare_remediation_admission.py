@@ -7,6 +7,12 @@ from dataclasses import replace
 
 import pytest
 
+from hoare_debugging_agent import (
+    DiagnosticDisposition,
+    DiagnosticFinding,
+    DiagnosticSeverity,
+    DebuggingReport,
+)
 from hoare_pick_admission import AdmissionDecision, PickRequest, ResourceRoute
 from hoare_remediation_admission import (
     RemediationAdmissionError,
@@ -14,12 +20,6 @@ from hoare_remediation_admission import (
     compile_remediation_admission_candidate,
 )
 from hoare_remediation_proposal import compile_remediation_proposal
-from hoare_debugging_agent import (
-    DiagnosticDisposition,
-    DiagnosticFinding,
-    DiagnosticSeverity,
-    DebuggingReport,
-)
 from product_verification import verify_product
 
 
@@ -73,7 +73,7 @@ def test_valid_proposal_becomes_non_executable_admission_candidate():
 
     assert candidate.authority == "admission-required"
     assert candidate.can_execute is False
-    assert candidate.request.intent == "hoare_remediation:revalidate_inputs"
+    assert candidate.request().intent == "hoare_remediation:revalidate_inputs"
     assert candidate.proposal_id == "proposal-1"
     assert candidate.proposal_hash
     assert candidate.candidate_hash
@@ -163,7 +163,7 @@ def test_provenance_survives_into_existing_admission_result():
 
     assert admission.decision is AdmissionDecision.ALLOW
     assert admission.request.intent == "hoare_remediation:revalidate_inputs"
-    assert admission.request.tenant_id == candidate.request.tenant_id
-    assert admission.request.order_id == candidate.request.order_id
-    assert admission.request.device_id == candidate.request.device_id
+    assert admission.request.tenant_id == candidate.tenant_id
+    assert admission.request.order_id == candidate.order_id
+    assert admission.request.device_id == candidate.device_id
     assert admission.resource_route is route
