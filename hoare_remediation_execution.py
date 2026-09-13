@@ -21,9 +21,11 @@ from typing import Any, Mapping
 from hoare_execution_plan import ExecutionPlan, compile_execution_plan
 from hoare_execution_request import (
     ExecutionAuthorization,
+    ExecutionReceipt,
     ExecutionRequest,
     authorize_execution,
     compile_execution_request,
+    create_execution_receipt,
     execution_signing_secret,
 )
 from hoare_pick_admission import AdmissionDecision, PickAdmission
@@ -214,11 +216,40 @@ def prepare_remediation_execution(
     )
 
 
+def finalize_remediation_receipt(
+    *,
+    authorized: RemediationExecutionAuthorization,
+    execution_id: str,
+    status: str,
+    result: Mapping[str, Any],
+    secret: str | None = None,
+    observed_at: float | None = None,
+) -> ExecutionReceipt:
+    """Create the normal signed receipt after the existing executor completes.
+
+    This function is a receipt boundary, not an executor. The caller must supply
+    the execution result produced by the existing executor. An unauthorized
+    remediation cannot manufacture a receipt through this orchestration layer.
+    """
+    if not authorized.authorization.allowed:
+        raise RemediationExecutionError("remediation_receipt_requires_authorization")
+    signing_secret = secret if secret is not None else execution_signing_secret()
+    return create_execution_receipt(
+        request=authorized.request,
+        execution_id=execution_id,
+        status=status,
+        result=result,
+        secret=signing_secret,
+        observed_at=observed_at,
+    )
+
+
 __all__ = [
     "ORCHESTRATOR_VERSION",
     "RemediationExecutionAuthorization",
     "RemediationExecutionBinding",
     "RemediationExecutionError",
     "SCHEMA_VERSION",
+    "finalize_remediation_receipt",
     "prepare_remediation_execution",
 ]
