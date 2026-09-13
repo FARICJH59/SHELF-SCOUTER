@@ -14,6 +14,15 @@ from typing import Any, Mapping
 
 from execution_feedback import ExecutionFeedbackRecorder, PickExecution
 from hoare_debugging_agent import DebuggingReport, HoareDebuggingAgent
+from hoare_pick_admission import PickRequest
+from hoare_remediation_admission import (
+    RemediationAdmissionCandidate,
+    compile_remediation_admission_candidate,
+)
+from hoare_remediation_proposal import (
+    RemediationProposal,
+    compile_remediation_proposal,
+)
 
 
 class HoareDebuggingRuntime:
@@ -56,6 +65,30 @@ class HoareDebuggingRuntime:
             execution_id=execution_id,
             observations=observations,
             execution_result=execution_result,
+        )
+
+    def propose_remediation_candidate(
+        self,
+        report: DebuggingReport,
+        *,
+        proposal_id: str,
+        action: str,
+        request: PickRequest,
+    ) -> RemediationAdmissionCandidate:
+        """Create a non-executable candidate for the existing admission gate.
+
+        This is deliberately a two-step operation: diagnosis becomes an
+        immutable proposal first, then the proposal is bound to a fresh
+        admission request. No authorization or execution occurs here.
+        """
+        proposal: RemediationProposal = compile_remediation_proposal(
+            report=report,
+            proposal_id=proposal_id,
+            action=action,
+        )
+        return compile_remediation_admission_candidate(
+            proposal=proposal,
+            request=request,
         )
 
 
