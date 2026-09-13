@@ -31,6 +31,16 @@ from fast_path import build_fast_path, route_fast_path
 from product_verification import ProductEvidence, verify_product, identity_summary
 from hoare_pick_admission import AdmissionDecision, PickRequest, ResourceRoute, admit_pick
 from execution_feedback import ExecutionFeedbackRecorder
+from hoare_execution_plan import compile_execution_plan
+from hoare_execution_request import (
+    SHELF_SCOUTER_CONTRACT_VERSION,
+    VISION_CAPABILITY_VERSION,
+    authorize_execution,
+    compile_execution_request,
+    create_execution_receipt,
+    execution_signing_secret,
+)
+
 from trusted_product_evidence import TrustedEvidenceAuthority, TrustedProductEvidence, verify_against_adapter
 from hoare_diagnostic_barcode import GovernedBarcodeRecovery
 from hoare_resource_route import server_resource_route
@@ -825,34 +835,203 @@ def v1_admission(session_id):
 
 @app.post("/v1/sessions/<session_id>/pick")
 def v1_pick(session_id):
+    """Execute a pick only after the complete HOARE execution boundary."""
     session = _session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+
     payload = request.get_json(silent=True) or {}
     product = payload.get("product")
     requested_sku = str(payload.get("sku") or "").strip()
     source_frame_id = payload.get("source_frame_id")
+
     if not product or not requested_sku or not source_frame_id:
-        return jsonify({"error": "product, sku, and source_frame_id are required"}), 400
-    frame = next((f for f in session["frames"] if f.get("frame_id") == source_frame_id), None)
+        return jsonify({
+            "error": "product, sku, and source_frame_id are required"
+        }), 400
+
+    frame = next(
+        (f for f in session["frames"] if f.get("frame_id") == source_frame_id),
+        None,
+    )
     if not frame:
         return jsonify({"error": "Source frame not found"}), 404
+
+    # Identity is derived exclusively from server-issued trusted evidence.
     identity = _identity_from_frame(frame, requested_sku)
+
+    # The phone cannot supply an authoritative route decision.
     route = _trusted_resource_route(payload, allow_server_route=True)
-    admission = admit_pick(PickRequest(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, device_id=session.get("device_id") or "unknown", store_id=session.get("store_id"), aisle=payload.get("aisle"), shelf=payload.get("shelf")), identity, route)
+
+    admission = admit_pick(
+        PickRequest(
+            tenant_id=session.get("tenant_id", "default"),
+            order_id=session.get("order_id", "unknown"),
+            requested_sku=requested_sku,
+            device_id=session.get("device_id") or "unknown",
+            store_id=session.get("store_id"),
+            aisle=payload.get("aisle"),
+            shelf=payload.get("shelf"),
+        ),
+        identity,
+        route,
+    )
+
     if admission.decision is not AdmissionDecision.ALLOW:
-        code = 409 if admission.decision is AdmissionDecision.ESCALATE else 403
-        return jsonify({"status": admission.decision.value, "reasons": admission.reasons, "identity": identity_summary(identity), "resource_route": route.__dict__, "action": "RECAPTURE_OR_TARGETED_VERIFICATION" if admission.decision is AdmissionDecision.ESCALATE else "STOP"}), code
+        code = (
+            409
+            if admission.decision is AdmissionDecision.ESCALATE
+            else 403
+        )
+        return jsonify({
+            "status": admission.decision.value,
+            "reasons": admission.reasons,
+            "identity": identity_summary(identity),
+            "resource_route": route.__dict__,
+            "action": (
+                "RECAPTURE_OR_TARGETED_VERIFICATION"
+                if admission.decision is AdmissionDecision.ESCALATE
+                else "STOP"
+            ),
+        }), code
+
     try:
         quantity = int(payload.get("quantity", 1))
     except (TypeError, ValueError):
         return jsonify({"error": "quantity must be an integer"}), 400
+
     if quantity < 1:
         return jsonify({"error": "quantity must be >= 1"}), 400
-    execution = _feedback.start(tenant_id=session.get("tenant_id", "default"), order_id=session.get("order_id", "unknown"), requested_sku=requested_sku, provider=route.provider or payload.get("provider", "edge"), region=route.region or payload.get("region", "edge-local"), device_id=session.get("device_id") or "unknown", model=(frame.get("result") or {}).get("model", "targeted-vision"))
-    completed = _feedback.complete(execution.execution_id, success=True, identity_status=identity.status.value, identity_confidence=identity.confidence)
-    pick = {"pick_id": str(uuid4()), "timestamp": datetime.now(timezone.utc).isoformat(), "product": product, "sku": requested_sku, "gtin": payload.get("gtin"), "quantity": quantity, "source_frame_id": source_frame_id, "status": "confirmed", "admission": {"decision": admission.decision.value, "reasons": admission.reasons}, "resource_route": route.__dict__, "execution": _feedback.telemetry_observation(completed.execution_id)}
+
+    # Execution requires server-verified evidence. Diagnostic recovery,
+    # client observations, and vision candidates cannot become authority.
+    trusted_evidence = _trusted_evidence_from_frame(frame)
+
+    if trusted_evidence is None:
+        return jsonify({
+            "status": "ESCALATE",
+            "reasons": ["trusted_evidence_required_for_execution"],
+            "identity": identity_summary(identity),
+            "resource_route": route.__dict__,
+            "action": "RECAPTURE_OR_TARGETED_VERIFICATION",
+        }), 409
+
+    signing_secret = execution_signing_secret()
+
+    if not signing_secret:
+        return jsonify({
+            "status": "EXECUTION_UNAVAILABLE",
+            "error": "HOARE_EXECUTION_SIGNING_KEY not configured",
+            "reasons": ["execution_signing_secret_required"],
+        }), 503
+
+    request_id = str(uuid4())
+
+    try:
+        # The execution plan is server-authoritative and is derived from
+        # the already-admitted request. Client plan data is never trusted.
+        execution_plan = compile_execution_plan(
+            admission=admission,
+            source_frame_id=source_frame_id,
+            evidence_signature=trusted_evidence.signature,
+            quantity=quantity,
+            capability_version=VISION_CAPABILITY_VERSION,
+            contract_version=SHELF_SCOUTER_CONTRACT_VERSION,
+        )
+
+        execution_request = compile_execution_request(
+            admission=admission,
+            request_id=request_id,
+            source_frame_id=source_frame_id,
+            evidence_signature=trusted_evidence.signature,
+            plan_hash=execution_plan.plan_hash,
+            secret=signing_secret,
+        )
+
+        authorization = authorize_execution(
+            execution_request,
+            secret=signing_secret,
+            expected_tenant_id=session.get("tenant_id", "default"),
+            expected_device_id=session.get("device_id") or "unknown",
+        )
+
+    except Exception as exc:
+        # Fail closed. Do not permit execution when the execution boundary
+        # cannot be constructed or independently authorized.
+        return jsonify({
+            "status": "EXECUTION_DENIED",
+            "error": str(exc),
+            "reasons": [str(exc)],
+        }), 403
+
+    if not authorization.allowed:
+        return jsonify({
+            "status": "EXECUTION_DENIED",
+            "error": "execution_request_authorization_failed",
+            "reasons": list(authorization.reasons),
+            "request_hash": execution_request.request_hash,
+        }), 403
+
+    # Existing execution recorder remains the actual execution path.
+    execution = _feedback.start(
+        tenant_id=session.get("tenant_id", "default"),
+        order_id=session.get("order_id", "unknown"),
+        requested_sku=requested_sku,
+        provider=route.provider or payload.get("provider", "edge"),
+        region=route.region or payload.get("region", "edge-local"),
+        device_id=session.get("device_id") or "unknown",
+        model=(frame.get("result") or {}).get(
+            "model",
+            "targeted-vision",
+        ),
+    )
+
+    completed = _feedback.complete(
+        execution.execution_id,
+        success=True,
+        identity_status=identity.status.value,
+        identity_confidence=identity.confidence,
+    )
+
+    execution_observation = _feedback.telemetry_observation(
+        completed.execution_id
+    )
+
+    # Make the execution ID explicit because the receipt binds to it.
+    execution_observation = {
+        **execution_observation,
+        "execution_id": completed.execution_id,
+    }
+
+    execution_receipt = create_execution_receipt(
+        request=execution_request,
+        execution_id=completed.execution_id,
+        status="SUCCEEDED",
+        result=execution_observation,
+        secret=signing_secret,
+    )
+
+    pick = {
+        "pick_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "product": product,
+        "sku": requested_sku,
+        "gtin": payload.get("gtin"),
+        "quantity": quantity,
+        "source_frame_id": source_frame_id,
+        "status": "confirmed",
+        "admission": {
+            "decision": admission.decision.value,
+            "reasons": admission.reasons,
+        },
+        "resource_route": route.__dict__,
+        "execution": execution_observation,
+        "execution_request": asdict(execution_request),
+        "execution_receipt": asdict(execution_receipt),
+    }
+
     session["picks"].append(pick)
+
     return jsonify(pick)
 
 

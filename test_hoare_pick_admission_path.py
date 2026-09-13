@@ -120,6 +120,9 @@ def test_valid_server_evidence_and_server_allow_reach_existing_execution_path(mo
     monkeypatch.setenv("HOARE_SERVER_ROUTE_DECISION", "ALLOW")
     monkeypatch.setenv("HOARE_SERVER_ROUTE_PROVIDER", "edge")
     monkeypatch.setenv("HOARE_SERVER_ROUTE_REGION", "edge-local")
+    monkeypatch.setenv("HOARE_EXECUTION_SIGNING_KEY", "execution-test-secret")
+    monkeypatch.setenv("HOARE_SERVER_ROUTE_PROVIDER", "edge")
+    monkeypatch.setenv("HOARE_SERVER_ROUTE_REGION", "edge-local")
 
     client = mobile_gateway.app.test_client()
     response = client.post(
@@ -139,6 +142,14 @@ def test_valid_server_evidence_and_server_allow_reach_existing_execution_path(mo
     assert body["admission"]["decision"] == "ALLOW"
     assert body["resource_route"]["decision"] == "ALLOW"
     assert body["execution"]["source"] == "shelf-scouter-execution"
+    assert body["execution_request"]["admission_decision"] == "ALLOW"
+    assert body["execution_request"]["plan_hash"]
+    assert body["execution_request"]["request_hash"]
+    assert body["execution_request"]["signature"]
+    assert body["execution_receipt"]["schema"] == "hoare.execution-receipt.v1"
+    assert body["execution_receipt"]["request_hash"] == body["execution_request"]["request_hash"]
+    assert body["execution_receipt"]["execution_id"] == body["execution"]["execution_id"]
+    assert body["execution_receipt"]["signature"]
     assert len(mobile_gateway._sessions[SESSION_ID]["picks"]) == 1
 
 def test_model_only_sku_match_cannot_create_trusted_identity():
