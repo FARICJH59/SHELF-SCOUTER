@@ -124,13 +124,6 @@ def compile_remediation_admission_candidate(
         raise RemediationAdmissionError("proposal_must_not_be_executable")
     if not proposal.proposal_id or not proposal.action:
         raise RemediationAdmissionError("proposal_identity_required")
-    if proposal.action not in {
-        "inspect_execution_telemetry",
-        "revalidate_inputs",
-    } and proposal.action not in {
-        proposal.action,
-    }:
-        raise RemediationAdmissionError("proposal_action_invalid")
     if not request.tenant_id or not request.order_id or not request.device_id:
         raise RemediationAdmissionError("admission_request_identity_required")
     if not request.requested_sku:
