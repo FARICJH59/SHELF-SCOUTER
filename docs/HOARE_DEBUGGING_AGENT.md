@@ -149,6 +149,41 @@ This means a remediation proposal has to earn a new admission decision. Prior ex
 
 The current adapter deliberately supports only the bounded actions `inspect_execution_telemetry` and `revalidate_inputs`. Adding another remediation action requires explicitly adding it to an admission adapter rather than silently broadening authority.
 
+## Remediation execution orchestration
+
+As of **2026-09-13**, `hoare_remediation_execution.py` provides the additive bridge from a newly admitted remediation candidate into the existing signed execution boundary:
+
+```text
+RemediationProposal
+      ↓
+RemediationAdmissionCandidate
+      ↓
+NEW HOARE / AEGIS ALLOW
+      ↓
+Fresh RemediationExecutionPlan
+      ↓
+Fresh SignedExecutionRequest
+      ↓
+Independent Authorization
+      ↓
+Existing Executor
+      ↓
+Signed Receipt
+```
+
+`prepare_remediation_execution()` requires an actual `AdmissionDecision.ALLOW` produced by the existing admission authority. It then:
+
+1. validates that the candidate is still non-executable;
+2. compiles a **new** server-authoritative execution plan;
+3. uses a remediation-specific operation name while preserving the existing plan schema;
+4. compiles a **new** signed execution request bound to the new plan hash;
+5. independently authorizes that new request against tenant/device identity and expiry;
+6. binds proposal ID/hash, candidate hash, original execution ID, original execution-boundary provenance, and the fresh admission hash to the internal execution trace.
+
+The orchestration does **not** call the executor. The existing executor remains the sole execution mechanism. A caller that receives an allowed `RemediationExecutionAuthorization` may pass its signed request through the same executor path already used by `/pick`, then create the normal signed receipt. This avoids creating a parallel remediation executor.
+
+A prior execution's authorization is never inherited. Even if the original execution was authorized, remediation must earn a new admission, plan, signed request, and authorization.
+
 ## Safety rules
 
 1. Client observations are never promoted to authority by diagnosis.
@@ -162,8 +197,11 @@ The current adapter deliberately supports only the bounded actions `inspect_exec
 9. A remediation admission candidate cannot self-authorize; it must pass through the existing admission authority.
 10. A new admission does not inherit prior execution authorization.
 11. Any newly admitted remediation must enter the existing execution-plan and signed-request authorization path.
-12. The debugger and adapter must remain independently testable and provider-neutral so they can later support other HOARE verticals.
+12. Remediation execution orchestration cannot manufacture `ALLOW` or invoke a parallel executor.
+13. Fresh remediation requests must bind a new plan hash, new request ID, trusted evidence, tenant/device identity, and expiration.
+14. Remediation provenance is control-plane telemetry and does not modify signed request authority.
+15. The debugger, admission adapter, and remediation orchestrator must remain independently testable and provider-neutral so they can later support other HOARE verticals.
 
 ## Relationship to SHELF-SCOUTER
 
-The debugger and remediation adapter can inspect and re-enter the existing server-side pick workflow, including trusted evidence, admission, execution telemetry, signed execution requests, authorization, and receipts. They do not replace or modify the existing executor.
+The debugger, remediation adapter, and remediation execution orchestration can inspect and re-enter the existing server-side pick workflow, including trusted evidence, admission, execution telemetry, signed execution requests, authorization, and receipts. They do not replace or modify the existing executor.
