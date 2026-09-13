@@ -19,6 +19,7 @@ from hoare_remediation_admission import (
 )
 from hoare_remediation_execution import (
     RemediationExecutionAuthorization,
+    RemediationExecutionError,
     prepare_remediation_execution,
 )
 from product_verification import ProductIdentity
@@ -76,19 +77,25 @@ def coordinate_remediation(
         resource_route=resource_route,
     )
 
-    execution = prepare_remediation_execution(
-        candidate=candidate,
-        admission=admission,
-        source_frame_id=source_frame_id,
-        evidence_signature=evidence_signature,
-        quantity=quantity,
-        capability_version=capability_version,
-        contract_version=contract_version,
-        request_id=request_id,
-        secret=secret,
-        now=now,
-        ttl_seconds=ttl_seconds,
-    )
+    try:
+        execution = prepare_remediation_execution(
+            candidate=candidate,
+            admission=admission,
+            source_frame_id=source_frame_id,
+            evidence_signature=evidence_signature,
+            quantity=quantity,
+            capability_version=capability_version,
+            contract_version=contract_version,
+            request_id=request_id,
+            secret=secret,
+            now=now,
+            ttl_seconds=ttl_seconds,
+        )
+    except RemediationExecutionError as exc:
+        # Preserve the coordinator boundary: callers should not need to know
+        # which lower remediation stage rejected progression. The original
+        # reason remains intact for diagnostics and tests.
+        raise RemediationCoordinatorError(str(exc)) from exc
 
     return RemediationExecutionPreparation(
         admission=admission,
