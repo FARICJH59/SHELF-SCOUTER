@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from math import ceil
 from time import perf_counter
 from uuid import uuid4
+from typing import Any, Mapping
 
 from hoare_debugging_agent import DebuggingReport, HoareDebuggingAgent
 
@@ -39,6 +40,8 @@ class ExecutionFeedbackRecorder:
     authorize, execute, retry, or mutate the execution boundary.
     """
 
+    _instances: dict[str, "ExecutionFeedbackRecorder"] = {}
+
     def __init__(self, debugger: HoareDebuggingAgent | None = None) -> None:
         self._records: dict[str, PickExecution] = {}
         self._clocks: dict[str, float] = {}
@@ -55,6 +58,7 @@ class ExecutionFeedbackRecorder:
         )
         self._records[execution_id] = record
         self._clocks[execution_id] = perf_counter()
+        self._instances[execution_id] = self
         return record
 
     def complete(self, execution_id: str, *, success: bool,
@@ -107,6 +111,36 @@ class ExecutionFeedbackRecorder:
     def diagnostic_snapshot(self) -> list[DebuggingReport]:
         """Return diagnostic reports without exposing them through pick APIs."""
         return list(self._diagnostic_reports.values())
+
+    @classmethod
+    def attach_execution_boundary(
+        cls,
+        execution_id: str,
+        trace: Mapping[str, Any],
+    ) -> None:
+        """Attach signed-boundary provenance to an existing diagnostic report.
+
+        This is a control-plane telemetry hook only. It never changes the
+        PickExecution result and never grants authority to the debugger.
+        """
+        recorder = cls._instances.get(execution_id)
+        if recorder is None:
+            return
+        report = recorder._diagnostic_reports.get(execution_id)
+        if report is None:
+            return
+
+        metadata = dict(report.metadata)
+        metadata["execution_boundary"] = dict(trace)
+        recorder._diagnostic_reports[execution_id] = DebuggingReport(
+            schema=report.schema,
+            debugger_version=report.debugger_version,
+            session_id=report.session_id,
+            execution_id=report.execution_id,
+            disposition=report.disposition,
+            findings=report.findings,
+            metadata=metadata,
+        )
 
     def snapshot(self) -> list[PickExecution]:
         return list(self._records.values())
