@@ -36,6 +36,10 @@ VISION_CAPABILITY_VERSION = "1.0.0"
 DEFAULT_TTL_SECONDS = 30.0
 MAX_TTL_SECONDS = 300.0
 
+# Diagnostic-only trace state. This is deliberately outside the signed request
+# payload so debugging provenance cannot alter execution authority.
+_EXECUTION_TRACE: dict[str, dict[str, Any]] = {}
+
 
 class ExecutionRequestError(ValueError):
     """Raised when an execution request cannot be safely constructed."""
@@ -60,6 +64,33 @@ def _hmac_hex(secret: str, payload: Mapping[str, Any]) -> str:
         _canonical_json(payload),
         hashlib.sha256,
     ).hexdigest()
+
+
+def _admission_trace_hash(admission: PickAdmission) -> str:
+    """Hash the admission decision as diagnostic provenance only."""
+    route = admission.resource_route
+    payload = {
+        "decision": admission.decision.value,
+        "reasons": list(admission.reasons),
+        "tenant_id": admission.request.tenant_id,
+        "order_id": admission.request.order_id,
+        "requested_sku": admission.request.requested_sku,
+        "device_id": admission.request.device_id,
+        "store_id": admission.request.store_id,
+        "aisle": admission.request.aisle,
+        "shelf": admission.request.shelf,
+        "intent": admission.request.intent,
+        "identity_status": admission.identity_status.value,
+        "identity_confidence": admission.identity_confidence,
+        "resource_route": {
+            "decision": route.decision.value if route else None,
+            "provider": route.provider if route else None,
+            "region": route.region if route else None,
+            "predicted_latency_ms": route.predicted_latency_ms if route else None,
+            "reason": list(route.reason or ()) if route else [],
+        },
+    }
+    return _sha256_hex(payload)
 
 
 @dataclass(frozen=True)
@@ -204,11 +235,23 @@ def compile_execution_request(
     }
     request_hash = _sha256_hex(unsigned)
     signature = _hmac_hex(secret, unsigned)
-    return ExecutionRequest(
+    request = ExecutionRequest(
         **unsigned,
         request_hash=request_hash,
         signature=signature,
     )
+
+    _EXECUTION_TRACE[request_hash] = {
+        "trace_version": "hoare.execution-trace.v1",
+        "request_id": request.request_id,
+        "request_hash": request.request_hash,
+        "admission_hash": _admission_trace_hash(admission),
+        "admission_decision": admission.decision.value,
+        "evidence_signature": evidence_signature,
+        "plan_hash": plan_hash,
+        "authorization": None,
+    }
+    return request
 
 
 def authorize_execution(
@@ -251,12 +294,26 @@ def authorize_execution(
     if expected_device_id is not None and request.device_id != expected_device_id:
         reasons.append("execution_request_device_mismatch")
 
-    return ExecutionAuthorization(
+    authorization = ExecutionAuthorization(
         allowed=not reasons,
         reasons=tuple(reasons) if reasons else ("execution_request_authorized",),
         request_hash=request.request_hash,
         authorized_at=current,
     )
+    trace = _EXECUTION_TRACE.setdefault(request.request_hash, {
+        "trace_version": "hoare.execution-trace.v1",
+        "request_id": request.request_id,
+        "request_hash": request.request_hash,
+        "plan_hash": request.plan_hash,
+        "evidence_signature": request.evidence_signature,
+        "authorization": None,
+    })
+    trace["authorization"] = {
+        "allowed": authorization.allowed,
+        "reasons": list(authorization.reasons),
+        "authorized_at": authorization.authorized_at,
+    }
+    return authorization
 
 
 def create_execution_receipt(
@@ -287,10 +344,33 @@ def create_execution_receipt(
         "result_hash": result_hash,
     }
     signature = _hmac_hex(secret, unsigned)
-    return ExecutionReceipt(
+    receipt = ExecutionReceipt(
         **unsigned,
         signature=signature,
     )
+
+    receipt_hash = hashlib.sha256(_canonical_json(unsigned)).hexdigest()
+    trace = dict(_EXECUTION_TRACE.get(request.request_hash, {}))
+    trace.update({
+        "receipt_hash": receipt_hash,
+        "receipt_signature": receipt.signature,
+        "receipt_schema": receipt.schema,
+        "execution_id": execution_id,
+    })
+
+    # Bridge into the already-created diagnostic report without importing the
+    # recorder at module import time. This avoids a circular dependency and
+    # keeps the execution boundary authoritative and provider-neutral.
+    try:
+        from execution_feedback import ExecutionFeedbackRecorder
+
+        ExecutionFeedbackRecorder.attach_execution_boundary(execution_id, trace)
+    except Exception:
+        # Diagnostic enrichment is best-effort telemetry. It must never turn a
+        # valid signed receipt into an execution failure.
+        pass
+
+    return receipt
 
 
 def execution_signing_secret() -> str:
