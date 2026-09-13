@@ -32,6 +32,12 @@ from product_verification import ProductIdentity
 
 SCHEMA_VERSION = "hoare.remediation-admission-candidate.v1"
 ADAPTER_VERSION = "1.0.0"
+SUPPORTED_ADMISSION_ACTIONS = frozenset(
+    {
+        "inspect_execution_telemetry",
+        "revalidate_inputs",
+    }
+)
 
 
 class RemediationAdmissionError(ValueError):
@@ -124,6 +130,8 @@ def compile_remediation_admission_candidate(
         raise RemediationAdmissionError("proposal_must_not_be_executable")
     if not proposal.proposal_id or not proposal.action:
         raise RemediationAdmissionError("proposal_identity_required")
+    if proposal.action not in SUPPORTED_ADMISSION_ACTIONS:
+        raise RemediationAdmissionError("proposal_action_not_supported_for_admission")
     if not request.tenant_id or not request.order_id or not request.device_id:
         raise RemediationAdmissionError("admission_request_identity_required")
     if not request.requested_sku:
@@ -207,6 +215,7 @@ __all__ = [
     "RemediationAdmissionCandidate",
     "RemediationAdmissionError",
     "SCHEMA_VERSION",
+    "SUPPORTED_ADMISSION_ACTIONS",
     "admit_remediation_candidate",
     "compile_remediation_admission_candidate",
 ]
